@@ -194,6 +194,11 @@ public:
 	constexpr DeltaAngle operator*(int32_t k) const noexcept {
 		return DeltaAngle(raw_ * k);
 	}
+#ifndef SF_INT_EQUALS_INT32
+	constexpr DeltaAngle operator*(int k) const noexcept {
+		return DeltaAngle(raw_ * int32_t(k));
+	}
+#endif
 
 	friend constexpr DeltaAngle operator*(SoftFloat s, DeltaAngle d) noexcept;
 
@@ -318,6 +323,11 @@ public:
 	constexpr Angle operator*(uint32_t k) const noexcept {
 		return Angle(raw_ * k);
 	}
+#ifndef SF_INT_EQUALS_INT32
+	constexpr Angle operator*(int k) const noexcept {
+		return Angle(raw_ * int32_t(k));
+	}
+#endif
 
 	// Trigonometric functions on Angle — return FixedQ30 for maximum speed
 	[[nodiscard]] constexpr FixedQ30 sin() const noexcept;
@@ -1999,6 +2009,9 @@ struct SoftFloat::MulExpr {
 	[[nodiscard]] constexpr SoftFloat operator/(SoftFloat r)  const noexcept { return eval() / r; }
 	[[nodiscard]] constexpr SoftFloat operator/(float r)      const noexcept { return eval() / SoftFloat(r); }
 	[[nodiscard]] constexpr SoftFloat operator/(int32_t r)    const noexcept { return eval() / SoftFloat(r); }
+#ifndef SF_INT_EQUALS_INT32
+	[[nodiscard]] constexpr SoftFloat operator/(int r)    const noexcept { return eval() / SoftFloat(r); }
+#endif
 	[[nodiscard]] constexpr SoftFloat operator>>(int s)       const noexcept { return eval() >> s; }
 	[[nodiscard]] constexpr SoftFloat operator<<(int s)       const noexcept { return eval() << s; }
 
