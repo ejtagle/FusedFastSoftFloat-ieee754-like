@@ -21,6 +21,9 @@
 #pragma once
 #include <cstdint>
 
+// If defined, will force inline everything, otherwise, only inlines hot path
+#undef MAXIMUM_SPEED
+
 #ifndef INT_MAX
 #   define INT_MAX 2147483647
 #endif
@@ -36,8 +39,8 @@
 // Platform detection
 // =========================================================================
 #if defined(__GNUC__) || defined(__clang__)
+# if 1
 #   define SF_INLINE    __attribute__((always_inline)) inline
-#   define SF_NOINLINE  __attribute__((noinline))
 #   define SF_HOT       __attribute__((hot))
 #   define SF_FLATTEN   __attribute__((flatten))
 #   define SF_PURE      __attribute__((pure))
@@ -45,9 +48,18 @@
 #   define LIKELY(x)    __builtin_expect(!!(x), 1)
 #   define UNLIKELY(x)  __builtin_expect(!!(x), 0)
 #   define IS_CONST(x)  __builtin_constant_p(x)
+# else
+#   define SF_INLINE    
+#   define SF_HOT       
+#   define SF_FLATTEN   
+#   define SF_PURE      __attribute__((pure))
+#   define SF_CONST     __attribute__((const))
+#   define LIKELY(x)    __builtin_expect(!!(x), 1)
+#   define UNLIKELY(x)  __builtin_expect(!!(x), 0)
+#   define IS_CONST(x)  __builtin_constant_p(x)
+# endif
 #else
 #   define SF_INLINE    inline
-#   define SF_NOINLINE
 #   define SF_HOT
 #   define SF_FLATTEN
 #   define SF_PURE
@@ -56,6 +68,7 @@
 #   define UNLIKELY(x)  (x)
 #   define IS_CONST(x)  0
 #endif
+
 
 // =========================================================================
 // Consteval detection (no extra #include needed — GCC/Clang built-in)
@@ -139,6 +152,20 @@ public:
 
 	constexpr FixedQ30& operator+=(FixedQ30 rhs) noexcept { raw_ += rhs.raw_; return *this; }
 	constexpr FixedQ30& operator-=(FixedQ30 rhs) noexcept { raw_ -= rhs.raw_; return *this; }
+
+	// ------------------------------------------------------------------
+	// Clamp — constexpr
+	// ------------------------------------------------------------------
+	[[nodiscard]] constexpr FixedQ30 clamp(FixedQ30 lo, FixedQ30 hi) const noexcept {
+		if (*this < lo)
+			return lo;
+		if (*this > hi)
+			return hi;
+		return *this;
+	}
+	[[nodiscard]] constexpr SF_INLINE FixedQ30 clamp(float lo, FixedQ30 hi) const noexcept { return clamp(FixedQ30(lo), hi); }
+	[[nodiscard]] constexpr SF_INLINE FixedQ30 clamp(FixedQ30 lo, float hi) const noexcept { return clamp(lo, FixedQ30(hi)); }
+	[[nodiscard]] constexpr SF_INLINE FixedQ30 clamp(float lo, float hi) const noexcept { return clamp(FixedQ30(lo), FixedQ30(hi)); }
 
 	[[nodiscard]] constexpr float to_float() const noexcept;
 
@@ -638,26 +665,8 @@ private:
 	// finish_addsub (signed wrapper) removed — never called.  All callers
 	// use finish_addsub_u directly with unsigned magnitude + separate sign.
 
-#if 0
-	// finish_addsub_u for unsigned mantissa: takes magnitude + sign separately
-	[[nodiscard]] static constexpr SF_INLINE SoftFloat finish_addsub_u(uint32_t rm, int32_t re, uint16_t neg) noexcept {
-		if (UNLIKELY(rm == 0)) return zero();
+#ifdef MAXIMUM_SPEED
 
-		// Branchless overflow handling
-		uint32_t ov = rm >> 30;
-		rm >>= ov;
-		re  += static_cast<int32_t>(ov);
-
-		if (LIKELY(ov || (rm & MANT_TOP_TWO) == MANT_MIN)) {
-			return from_raw_normalized(rm, re, neg);
-		}
-
-		int sh = clz(rm) - 2;
-		rm <<= sh;
-		re -= sh;
-		return from_raw_normalized(rm, re, neg);
-	}
-#else
 	[[nodiscard]] static constexpr SF_INLINE SoftFloat finish_addsub_u(uint32_t rm, int32_t re, uint16_t neg) noexcept {
 		if (UNLIKELY(rm == 0)) return zero();
 
@@ -697,6 +706,58 @@ private:
 		int sh = clz(rm) - 2;
 		return from_raw_normalized(rm << sh, re - sh, neg);
 	}
+	
+#else
+
+	// -----------------------------------------------------------------
+	// Hot/cold split for the add/subtract finalisers.
+	//
+	// The common case (result mantissa already normalised in [2^29, 2^30))
+	// is kept inline — it only needs the rounding + pack.  The rare case
+	// (cancellation shrank the result below 2^29, requiring a CLZ-based
+	// renormalise) is delegated to renorm_slow(), a single noinline+cold
+	// function.  This implements the requested strategy: inline the hot
+	// path, forbid inlining of the cold path, saving FLASH (the CLZ
+	// renormalise code is emitted once, not duplicated at every call site)
+	// at the cost of slightly slower execution only when real cancellation
+	// occurs.
+	// -----------------------------------------------------------------
+	[[gnu::noinline]] static constexpr
+	SoftFloat renorm_slow(uint32_t rm, int32_t re, uint16_t neg) noexcept {
+		int sh = clz(rm) - 2;
+		return from_raw_normalized(rm << sh, re - sh, neg);
+	}
+
+	[[nodiscard]] static constexpr SF_INLINE
+	SoftFloat finish_addsub_u(uint32_t rm, int32_t re, uint16_t neg) noexcept {
+		if (UNLIKELY(rm == 0)) return zero();
+
+		uint32_t ov = rm >> 30;
+		rm >>= ov;
+		re  += static_cast<int32_t>(ov);
+
+		// HOT (inlined): after the carry-out shift the mantissa is already
+		// normalised — straight to pack, skipping the CLZ entirely.
+		if (LIKELY(ov || (rm & MANT_TOP_TWO) == MANT_MIN))
+			return from_raw_normalized(rm, re, neg);
+
+		// COLD (out-of-line): genuine cancellation.
+		return renorm_slow(rm, re, neg);
+	}
+
+	// Subtraction finalizer for |large|-|small|.  The magnitude difference
+	// can never overflow above the Q29 interval; the common case is already
+	// normalised and only needs the final pack/round.
+	[[nodiscard]] static constexpr SF_INLINE
+	SoftFloat finish_sub_mag(uint32_t rm, int32_t re, uint16_t neg) noexcept {
+		if (UNLIKELY(rm == 0)) return zero();
+		// HOT (inlined): no cancellation.
+		if (LIKELY(rm >= MANT_MIN)) return from_raw_normalized(rm, re, neg);
+		// COLD (out-of-line): cancellation shrank the result below 2^29.
+		return renorm_slow(rm, re, neg);
+	}
+	
+#endif
 
 	// Same-sign addition finalizer.  When two normalized Q29 mantissas
 	// (each in [2^29, 2^30)) are added, the sum is always in [2^30, 2^31): it
@@ -710,8 +771,6 @@ private:
 		re += static_cast<int32_t>(ov);
 		return from_raw_normalized(rm, re, neg);
 	}
-
-#endif
 
 	[[nodiscard]] static constexpr uint64_t isqrt64(uint64_t n) noexcept {
 		if (n < 2) return n;
