@@ -176,6 +176,23 @@ public:
 		return FixedQ30(-raw_);
 	}
 
+	[[nodiscard]] constexpr friend int32_t operator*(FixedQ30 lhs, int32_t rhs) noexcept {
+		// Q30 * int32 -> int32, with saturation.  The raw multiplication is
+		// exact (Q30 fits in 32 bits), but the result may overflow int32.
+		int64_t product = (static_cast<int64_t>(lhs.raw_) * static_cast<int64_t>(rhs)) >> 30;
+		if (product > INT32_MAX) return INT32_MAX;
+		if (product < INT32_MIN) return INT32_MIN;
+		return static_cast<int32_t>(product);
+	}
+	[[nodiscard]] constexpr friend int32_t operator*(int32_t lhs, FixedQ30 rhs) noexcept {
+		// Q30 * int32 -> int32, with saturation.  The raw multiplication is
+		// exact (Q30 fits in 32 bits), but the result may overflow int32.
+		int64_t product = (static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs.raw_)) >> 30;
+		if (product > INT32_MAX) return INT32_MAX;
+		if (product < INT32_MIN) return INT32_MIN;
+		return static_cast<int32_t>(product);
+	}
+
 	[[nodiscard]] static constexpr FixedQ30 zero() noexcept { return FixedQ30(int32_t(0)); }
 	[[nodiscard]] static constexpr FixedQ30 one()  noexcept { return FixedQ30(1.0f); }
 };
@@ -457,7 +474,6 @@ private:
 	// functions that just added a call + return overhead on every hot path.
 
 	static constexpr SF_INLINE void normalise_fast(int32_t& m, int32_t& e) noexcept;
-	[[nodiscard]] static constexpr SF_CONST SF_INLINE uint32_t recip32(uint32_t b) noexcept;
 
 private:
 	// ------------------------------------------------------------------
@@ -510,8 +526,12 @@ private:
 			uint32_t s = static_cast<uint32_t>(neg) << 31;
 			int32_t be_m1 = e + (EXP_BIAS - 1);
 			
-			if (UNLIKELY(be_m1 < 0)) return 0u;
-			if (UNLIKELY(be_m1 > 254)) return s | 0x7FFFFFFFu;
+                        // Combined range check: unsigned comparison catches both
+                        // be_m1 < 0 (underflow) and be_m1 > 254 (overflow) in one branch.
+                        if (UNLIKELY(static_cast<uint32_t>(be_m1) > 254u)) {
+                                if (be_m1 < 0) return 0u;
+                                return s | 0x7FFFFFFFu;
+                        }
 
 			uint32_t out;
 			__asm__(
@@ -769,6 +789,32 @@ private:
 		uint32_t ov = rm >> 30;           // 0 or 1 (sum < 2^31)
 		rm >>= ov;
 		re += static_cast<int32_t>(ov);
+                // rm is guaranteed >= MANT_MIN (2^29) here, so we can skip
+                // the m == 0 check that pack_normalized_bits does.
+                // Inline the pack to save 2 instructions on the hot path.
+#if defined(__arm__)
+                if (!SF_IS_CONSTEVAL()) {
+                        uint32_t s = static_cast<uint32_t>(neg) << 31;
+                        int32_t be_m1 = re + (EXP_BIAS - 1);
+                        // Combined range check: unsigned comparison catches both
+                        // be_m1 < 0 (underflow) and be_m1 > 254 (overflow) in one
+                        // branch instead of two.
+                        if (UNLIKELY(static_cast<uint32_t>(be_m1) > 254u)) {
+                                if (be_m1 < 0) return zero();
+                                return from_bits_unchecked(s | 0x7FFFFFFFu);
+                        }
+                        uint32_t out;
+                        __asm__(
+                            "lsrs  %[out], %[m], #6\n\t"
+                            "adc.w %[out], %[out], %[be_m1], lsl #23\n\t"
+                            : [out] "=&r"(out)
+                            : [m] "r"(rm), [be_m1] "r"(be_m1)
+                            : "cc");
+                        if (UNLIKELY(out & 0x80000000u))
+                                out = 0x7FFFFFFFu;
+                        return from_bits_unchecked(s | out);
+                }
+#endif
 		return from_raw_normalized(rm, re, neg);
 	}
 
@@ -1179,144 +1225,184 @@ private:
 		0x16A09E66,
 	};
 
+        // Hoisted from atan2(), exp(), log2() to fix C++20 constexpr-evaluation rules.
+        static constexpr uint32_t ATAN_RAW_TAB[258] = {
+                0x00000000u, 0x0028BE53u, 0x00517C55u, 0x007A39B4u, 0x00A2F61Eu, 0x00CBB143u, 0x00F46AD1u, 0x011D2276u,
+                0x0145D7E1u, 0x016E8AC2u, 0x01973AC8u, 0x01BFE7A1u, 0x01E890FDu, 0x0211368Bu, 0x0239D7FCu, 0x026274FEu,
+                0x028B0D43u, 0x02B3A07Au, 0x02DC2E54u, 0x0304B681u, 0x032D38B4u, 0x0355B49Cu, 0x037E29EBu, 0x03A69855u,
+                0x03CEFF8Au, 0x03F75F3Du, 0x041FB721u, 0x044806EAu, 0x04704E4Bu, 0x04988CF8u, 0x04C0C2A5u, 0x04E8EF07u,
+                0x051111D4u, 0x05392AC1u, 0x05613984u, 0x05893DD4u, 0x05B13767u, 0x05D925F6u, 0x06010937u, 0x0628E0E5u,
+                0x0650ACB7u, 0x06786C67u, 0x06A01FAFu, 0x06C7C649u, 0x06EF5FF2u, 0x0716EC63u, 0x073E6B5Bu, 0x0765DC95u,
+                0x078D3FCFu, 0x07B494C6u, 0x07DBDB3Au, 0x080312EAu, 0x082A3B95u, 0x085154FCu, 0x08785EDFu, 0x089F5902u,
+                0x08C64325u, 0x08ED1D0Du, 0x0913E67Cu, 0x093A9F37u, 0x09614704u, 0x0987DDA7u, 0x09AE62E7u, 0x09D4D68Bu,
+                0x09FB385Bu, 0x0A218820u, 0x0A47C5A2u, 0x0A6DF0ACu, 0x0A940907u, 0x0ABA0E80u, 0x0AE000E2u, 0x0B05DFFAu,
+                0x0B2BAB95u, 0x0B516382u, 0x0B770790u, 0x0B9C978Du, 0x0BC2134Cu, 0x0BE77A9Bu, 0x0C0CCD4Fu, 0x0C320B38u,
+                0x0C57342Bu, 0x0C7C47FBu, 0x0CA1467Du, 0x0CC62F87u, 0x0CEB02EFu, 0x0D0FC08Du, 0x0D346837u, 0x0D58F9C7u,
+                0x0D7D7515u, 0x0DA1D9FCu, 0x0DC62856u, 0x0DEA6000u, 0x0E0E80D4u, 0x0E328AB1u, 0x0E567D73u, 0x0E7A58FAu,
+                0x0E9E1D24u, 0x0EC1C9D1u, 0x0EE55EE3u, 0x0F08DC39u, 0x0F2C41B7u, 0x0F4F8F3Fu, 0x0F72C4B4u, 0x0F95E1FBu,
+                0x0FB8E6F9u, 0x0FDBD394u, 0x0FFEA7B1u, 0x10216337u, 0x1044060Fu, 0x10669021u, 0x10890156u, 0x10AB5998u,
+                0x10CD98D1u, 0x10EFBEEDu, 0x1111CBD6u, 0x1133BF7Au, 0x115599C7u, 0x11775AA8u, 0x1199020Eu, 0x11BA8FE7u,
+                0x11DC0423u, 0x11FD5EB3u, 0x121E9F86u, 0x123FC690u, 0x1260D3C2u, 0x1281C70Fu, 0x12A2A06Au, 0x12C35FC8u,
+                0x12E4051Eu, 0x13049060u, 0x13250184u, 0x13455882u, 0x1365954Fu, 0x1385B7E4u, 0x13A5C038u, 0x13C5AE45u,
+                0x13E58204u, 0x14053B6Eu, 0x1424DA7Eu, 0x14445F2Eu, 0x1463C97Au, 0x1483195Fu, 0x14A24ED8u, 0x14C169E2u,
+                0x14E06A7Bu, 0x14FF50A0u, 0x151E1C51u, 0x153CCD8Cu, 0x155B6450u, 0x1579E09Eu, 0x15984275u, 0x15B689D7u,
+                0x15D4B6C5u, 0x15F2C93Fu, 0x1610C149u, 0x162E9EE6u, 0x164C6217u, 0x166A0AE0u, 0x16879946u, 0x16A50D4Cu,
+                0x16C266F7u, 0x16DFA64Cu, 0x16FCCB50u, 0x1719D60Au, 0x1736C67Fu, 0x17539CB6u, 0x177058B6u, 0x178CFA85u,
+                0x17A9822Du, 0x17C5EFB4u, 0x17E24323u, 0x17FE7C82u, 0x181A9BDBu, 0x1836A137u, 0x18528C9Fu, 0x186E5E1Du,
+                0x188A15BCu, 0x18A5B386u, 0x18C13785u, 0x18DCA1C6u, 0x18F7F252u, 0x19132937u, 0x192E4680u, 0x19494A38u,
+                0x1964346Eu, 0x197F052Cu, 0x1999BC81u, 0x19B45A79u, 0x19CEDF22u, 0x19E94A8Au, 0x1A039CBEu, 0x1A1DD5CDu,
+                0x1A37F5C5u, 0x1A51FCB4u, 0x1A6BEAAAu, 0x1A85BFB5u, 0x1A9F7BE5u, 0x1AB91F49u, 0x1AD2A9F0u, 0x1AEC1BEBu,
+                0x1B057548u, 0x1B1EB61Au, 0x1B37DE6Fu, 0x1B50EE58u, 0x1B69E5E6u, 0x1B82C529u, 0x1B9B8C33u, 0x1BB43B15u,
+                0x1BCCD1E0u, 0x1BE550A5u, 0x1BFDB776u, 0x1C160664u, 0x1C2E3D81u, 0x1C465CE0u, 0x1C5E6492u, 0x1C7654A9u,
+                0x1C8E2D38u, 0x1CA5EE52u, 0x1CBD9807u, 0x1CD52A6Cu, 0x1CECA593u, 0x1D04098Fu, 0x1D1B5672u, 0x1D328C4Fu,
+                0x1D49AB3Bu, 0x1D60B347u, 0x1D77A487u, 0x1D8E7F0Fu, 0x1DA542F1u, 0x1DBBF042u, 0x1DD28714u, 0x1DE9077Cu,
+                0x1DFF718Cu, 0x1E15C55Au, 0x1E2C02F8u, 0x1E422A7Au, 0x1E583BF4u, 0x1E6E377Bu, 0x1E841D21u, 0x1E99ECFCu,
+                0x1EAFA71Fu, 0x1EC54B9Eu, 0x1EDADA8Du, 0x1EF05401u, 0x1F05B80Eu, 0x1F1B06C8u, 0x1F304043u, 0x1F456493u,
+                0x1F5A73CDu, 0x1F6F6E05u, 0x1F84534Fu, 0x1F9923C0u, 0x1FADDF6Bu, 0x1FC28667u, 0x1FD718C6u, 0x1FEB969Du,
+                0x20000000u, 0x20000000u
+        };
+
+        static constexpr int32_t EXP_MANT[257] = {
+                0x20000000, 0x201635F5, 0x202C7B54, 0x2042D028,
+                0x2059347D, 0x206FA85C, 0x20862BD1, 0x209CBEE6,
+                0x20B361A6, 0x20CA141C, 0x20E0D654, 0x20F7A857,
+                0x210E8A31, 0x21257BED, 0x213C7D96, 0x21538F36,
+                0x216AB0DA, 0x2181E28C, 0x21992457, 0x21B07646,
+                0x21C7D866, 0x21DF4AC0, 0x21F6CD60, 0x220E6052,
+                0x222603A0, 0x223DB757, 0x22557B81, 0x226D502A,
+                0x2285355D, 0x229D2B27, 0x22B53191, 0x22CD48A9,
+                0x22E57079, 0x22FDA90D, 0x2315F271, 0x232E4CB0,
+                0x2346B7D7, 0x235F33F0, 0x2377C108, 0x23905F2A,
+                0x23A90E63, 0x23C1CEBD, 0x23DAA046, 0x23F38308,
+                0x240C7711, 0x24257C6B, 0x243E9323, 0x2457BB45,
+                0x2470F4DD, 0x248A3FF7, 0x24A39C9F, 0x24BD0AE2,
+                0x24D68ACC, 0x24F01C68, 0x2509BFC4, 0x252374EB,
+                0x253D3BEA, 0x255714CE, 0x2570FFA2, 0x258AFC73,
+                0x25A50B4E, 0x25BF2C3F, 0x25D95F52, 0x25F3A495,
+                0x260DFC14, 0x262865DC, 0x2642E1F9, 0x265D7077,
+                0x26781165, 0x2692C4CE, 0x26AD8ABF, 0x26C86346,
+                0x26E34E6E, 0x26FE4C46, 0x27195CDA, 0x27348037,
+                0x274FB66A, 0x276AFF80, 0x27865B86, 0x27A1CA8A,
+                0x27BD4C98, 0x27D8E1BE, 0x27F48A09, 0x28104587,
+                0x282C1444, 0x2847F64E, 0x2863EBB3, 0x287FF47F,
+                0x289C10C1, 0x28B84085, 0x28D483DA, 0x28F0DACD,
+                0x290D456C, 0x2929C3C3, 0x294655E2, 0x2962FBD5,
+                0x297FB5AA, 0x299C8370, 0x29B96534, 0x29D65B04,
+                0x29F364ED, 0x2A1082FF, 0x2A2DB546, 0x2A4AFBD0,
+                0x2A6856AD, 0x2A85C5EA, 0x2AA34995, 0x2AC0E1BC,
+                0x2ADE8E6D, 0x2AFC4FB8, 0x2B1A25A9, 0x2B381050,
+                0x2B560FBB, 0x2B7423F7, 0x2B924D15, 0x2BB08B21,
+                0x2BCEDE2B, 0x2BED4642, 0x2C0BC373, 0x2C2A55CE,
+                0x2C48FD60, 0x2C67BA3A, 0x2C868C6A, 0x2CA573FD,
+                0x2CC47105, 0x2CE3838E, 0x2D02ABA9, 0x2D21E963,
+                0x2D413CCD, 0x2D60A5F5, 0x2D8024EA, 0x2D9FB9BC,
+                0x2DBF6479, 0x2DDF2531, 0x2DFEFBF3, 0x2E1EE8CE,
+                0x2E3EEBD2, 0x2E5F050E, 0x2E7F3491, 0x2E9F7A6C,
+                0x2EBFD6AD, 0x2EE04963, 0x2F00D2A0, 0x2F217271,
+                0x2F4228E8, 0x2F62F613, 0x2F83DA02, 0x2FA4D4C6,
+                0x2FC5E66E, 0x2FE70F09, 0x30084EA8, 0x3029A55C,
+                0x304B1333, 0x306C983D, 0x308E348C, 0x30AFE82F,
+                0x30D1B337, 0x30F395B2, 0x31158FB3, 0x3137A149,
+                0x3159CA84, 0x317C0B76, 0x319E642D, 0x31C0D4BC,
+                0x31E35D32, 0x3205FDA0, 0x3228B617, 0x324B86A7,
+                0x326E6F62, 0x32917057, 0x32B48998, 0x32D7BB35,
+                0x32FB0540, 0x331E67C9, 0x3341E2E2, 0x3365769B,
+                0x33892305, 0x33ACE833, 0x33D0C634, 0x33F4BD1A,
+                0x3418CCF7, 0x343CF5DB, 0x346137D9, 0x34859301,
+                0x34AA0764, 0x34CE9516, 0x34F33C26, 0x3517FCA8,
+                0x353CD6AB, 0x3561CA42, 0x3586D780, 0x35ABFE74,
+                0x35D13F33, 0x35F699CC, 0x361C0E53, 0x36419CD9,
+                0x36674571, 0x368D082B, 0x36B2E51C, 0x36D8DC54,
+                0x36FEEDE6, 0x372519E4, 0x374B6061, 0x3771C16F,
+                0x37983D21, 0x37BED388, 0x37E584B8, 0x380C50C3,
+                0x383337BB, 0x385A39B4, 0x388156C0, 0x38A88EF2,
+                0x38CFE25D, 0x38F75113, 0x391EDB28, 0x394680AF,
+                0x396E41BA, 0x39961E5D, 0x39BE16AB, 0x39E62AB7,
+                0x3A0E5A94, 0x3A36A656, 0x3A5F0E10, 0x3A8791D6,
+                0x3AB031BA, 0x3AD8EDD1, 0x3B01C62E, 0x3B2ABAE4,
+                0x3B53CC08, 0x3B7CF9AC, 0x3BA643E6, 0x3BCFAAC8,
+                0x3BF92E67, 0x3C22CED6, 0x3C4C8C2A, 0x3C766676,
+                0x3CA05DCF, 0x3CCA7249, 0x3CF4A3F8, 0x3D1EF2F0,
+                0x3D495F45, 0x3D73E90D, 0x3D9E905B, 0x3DC95544,
+                0x3DF437DD, 0x3E1F3839, 0x3E4A566F, 0x3E759292,
+                0x3EA0ECB7, 0x3ECC64F3, 0x3EF7FB5B, 0x3F23B004,
+                0x3F4F8303, 0x3F7B746D, 0x3FA78457, 0x3FD3B2D6,
+                0x20000000
+        };
+
+        static constexpr int32_t LOG2_Q30[257] = {
+                0x00000000, 0x005C2711, 0x00B7F285, 0x01136311,
+                0x016E7968, 0x01C9363B, 0x02239A3A, 0x027DA612,
+                0x02D75A6E, 0x0330B7F8, 0x0389BF57, 0x03E27130,
+                0x043ACE27, 0x0492D6DF, 0x04EA8BF7, 0x0541EE0D,
+                0x0598FDBE, 0x05EFBBA5, 0x0646285B, 0x069C4477,
+                0x06F21090, 0x07478D38, 0x079CBB04, 0x07F19A83,
+                0x08462C46, 0x089A70DA, 0x08EE68CB, 0x094214A5,
+                0x099574F1, 0x09E88A36, 0x0A3B54FC, 0x0A8DD5C8,
+                0x0AE00D1C, 0x0B31FB7D, 0x0B83A16A, 0x0BD4FF63,
+                0x0C2615E8, 0x0C76E574, 0x0CC76E83, 0x0D17B191,
+                0x0D67AF16, 0x0DB7678B, 0x0E06DB66, 0x0E560B1E,
+                0x0EA4F726, 0x0EF39FF1, 0x0F4205F3, 0x0F90299C,
+                0x0FDE0B5C, 0x102BABA2, 0x107908DB, 0x10C62975,
+                0x111307DA, 0x115FA676, 0x11AC05B2, 0x11F825F6,
+                0x124407AB, 0x128FAB35, 0x12DB10FC, 0x13263963,
+                0x13712ACE, 0x13BBD3A0, 0x1406463B, 0x14507CFE,
+                0x149A784B, 0x14E43880, 0x152DBDFC, 0x1577091B,
+                0x15C01A39, 0x1608F1B4, 0x16518FE4, 0x1699F524,
+                0x16E221CD, 0x172A1637, 0x1771D2BA, 0x17B957AC,
+                0x1800A563, 0x1847BC33, 0x188E9C72, 0x18D54673,
+                0x191BBA89, 0x1961F905, 0x19A80239, 0x19EDD675,
+                0x1A33760A, 0x1A78E146, 0x1ABE1879, 0x1B031BEF,
+                0x1B47EBF7, 0x1B8C88DB, 0x1BD0F2E9, 0x1C152A6C,
+                0x1C592FAD, 0x1C9D02F6, 0x1CE0A492, 0x1D2414C8,
+                0x1D6753E0, 0x1DAA6222, 0x1DED3FD4, 0x1E2FED3D,
+                0x1E726AA1, 0x1EB4B847, 0x1EF6D673, 0x1F38C567,
+                0x1F7A8568, 0x1FBC16B9, 0x1FFD799A, 0x203EAE4E,
+                0x207FB517, 0x20C08E33, 0x210139E4, 0x2141B869,
+                0x21820A01, 0x21C22EEA, 0x22022762, 0x2241F3A7,
+                0x228193F5, 0x22C10889, 0x2300519E, 0x233F6F71,
+                0x237E623D, 0x23BD2A3B, 0x23FBC7A6, 0x243A3AB7,
+                0x247883A8, 0x24B6A2B1, 0x24F4980B, 0x253263EC,
+                0x2570068E, 0x25AD8026, 0x25EAD0EB, 0x2627F914,
+                0x2664F8D5, 0x26A1D064, 0x26DE7FF6, 0x271B07C0,
+                0x275767F5, 0x2793A0C9, 0x27CFB26F, 0x280B9D1A,
+                0x284760FD, 0x2882FE49, 0x28BE7531, 0x28F9C5E5,
+                0x2934F097, 0x296FF577, 0x29AAD4B6, 0x29E58E83,
+                0x2A20230E, 0x2A5A9285, 0x2A94DD19, 0x2ACF02F7,
+                0x2B09044D, 0x2B42E149, 0x2B7C9A19, 0x2BB62EEA,
+                0x2BEF9FE8, 0x2C28ED40, 0x2C62171E, 0x2C9B1DAE,
+                0x2CD4011C, 0x2D0CC192, 0x2D455F3C, 0x2D7DDA44,
+                0x2DB632D4, 0x2DEE6917, 0x2E267D36, 0x2E5E6F5A,
+                0x2E963FAC, 0x2ECDEE56, 0x2F057B7F, 0x2F3CE751,
+                0x2F7431F2, 0x2FAB5B8B, 0x2FE26443, 0x30194C40,
+                0x305013AB, 0x3086BAA9, 0x30BD4161, 0x30F3A7F8,
+                0x3129EE96, 0x3160155E, 0x31961C76, 0x31CC0404,
+                0x3201CC2C, 0x32377512, 0x326CFEDB, 0x32A269AB,
+                0x32D7B5A5, 0x330CE2ED, 0x3341F1A7, 0x3376E1F5,
+                0x33ABB3FA, 0x33E067D9, 0x3414FDB4, 0x344975AD,
+                0x347DCFE7, 0x34B20C82, 0x34E62BA0, 0x351A2D62,
+                0x354E11EB, 0x3581D959, 0x35B583CE, 0x35E9116A,
+                0x361C824D, 0x364FD697, 0x36830E69, 0x36B629E1,
+                0x36E9291E, 0x371C0C41, 0x374ED367, 0x37817EAF,
+                0x37B40E39, 0x37E68222, 0x3818DA88, 0x384B178A,
+                0x387D3945, 0x38AF3FD7, 0x38E12B5D, 0x3912FBF4,
+                0x3944B1B9, 0x39764CC9, 0x39A7CD41, 0x39D9333D,
+                0x3A0A7EDA, 0x3A3BB033, 0x3A6CC764, 0x3A9DC48A,
+                0x3ACEA7C0, 0x3AFF7121, 0x3B3020C8, 0x3B60B6D1,
+                0x3B913356, 0x3BC19672, 0x3BF1E041, 0x3C2210DB,
+                0x3C52285C, 0x3C8226DD, 0x3CB20C79, 0x3CE1D948,
+                0x3D118D66, 0x3D4128EB, 0x3D70ABF1, 0x3DA01691,
+                0x3DCF68E3, 0x3DFEA301, 0x3E2DC503, 0x3E5CCF02,
+                0x3E8BC117, 0x3EBA9B59, 0x3EE95DE1, 0x3F1808C7,
+                0x3F469C22, 0x3F75180B, 0x3FA37C98, 0x3FD1C9E2,
+                0x40000000
+        };
 	// Hoisted large tables as static constexpr members of SoftFloat (and Angle for sin).
 	// This fixes "constexpr issues": C++20 does not allow (or has severe limitations on)
 	// local `static constexpr` arrays inside `constexpr` functions when the function
-	// is used in constant evaluation (recip32, atan2, exp, log2, Angle::sincos).
+	// is used in constant evaluation (atan2, exp, log2, Angle::sincos).
 	// Member tables are ODR-usable in all constant expressions and work with both
-	// runtime and consteval paths. (recip32 still has a consteval fallback that
-	// avoids the table via integer div.)
-	static constexpr uint32_t recip_tab[512] = {
-		0x80000000u, 0x7FC01FF0u, 0x7F807F80u, 0x7F411E52u,
-		0x7F01FC07u, 0x7EC31843u, 0x7E8472A8u, 0x7E460ADAu,
-		0x7E07E07Eu, 0x7DC9F339u, 0x7D8C42B2u, 0x7D4ECE8Fu,
-		0x7D119679u, 0x7CD49A16u, 0x7C97D910u, 0x7C5B5311u,
-		0x7C1F07C1u, 0x7BE2F6CEu, 0x7BA71FE1u, 0x7B6B82A6u,
-		0x7B301ECCu, 0x7AF4F3FEu, 0x7ABA01EAu, 0x7A7F4841u,
-		0x7A44C6AFu, 0x7A0A7CE6u, 0x79D06A96u, 0x79968F6Fu,
-		0x795CEB24u, 0x79237D65u, 0x78EA45E7u, 0x78B1445Cu,
-		0x78787878u, 0x783FE1F0u, 0x78078078u, 0x77CF53C5u,
-		0x77975B8Fu, 0x775F978Cu, 0x77280772u, 0x76F0AAF9u,
-		0x76B981DAu, 0x76828BCEu, 0x764BC88Cu, 0x761537D0u,
-		0x75DED952u, 0x75A8ACCFu, 0x7572B201u, 0x753CE8A4u,
-		0x75075075u, 0x74D1E92Fu, 0x749CB28Fu, 0x7467AC55u,
-		0x7432D63Du, 0x73FE3007u, 0x73C9B971u, 0x7395723Au,
-		0x73615A24u, 0x732D70EDu, 0x72F9B658u, 0x72C62A24u,
-		0x7292CC15u, 0x725F9BECu, 0x722C996Bu, 0x71F9C457u,
-		0x71C71C71u, 0x7194A17Fu, 0x71625344u, 0x71303185u,
-		0x70FE3C07u, 0x70CC728Fu, 0x709AD4E4u, 0x706962CCu,
-		0x70381C0Eu, 0x70070070u, 0x6FD60FBAu, 0x6FA549B4u,
-		0x6F74AE26u, 0x6F443CD9u, 0x6F13F596u, 0x6EE3D826u,
-		0x6EB3E453u, 0x6E8419E6u, 0x6E5478ACu, 0x6E25006Eu,
-		0x6DF5B0F7u, 0x6DC68A13u, 0x6D978B8Eu, 0x6D68B535u,
-		0x6D3A06D3u, 0x6D0B8036u, 0x6CDD212Bu, 0x6CAEE97Fu,
-		0x6C80D901u, 0x6C52EF7Fu, 0x6C252CC7u, 0x6BF790A8u,
-		0x6BCA1AF2u, 0x6B9CCB74u, 0x6B6FA1FEu, 0x6B429E60u,
-		0x6B15C06Bu, 0x6AE907EFu, 0x6ABC74BEu, 0x6A9006A9u,
-		0x6A63BD81u, 0x6A37991Au, 0x6A0B9944u, 0x69DFBDD4u,
-		0x69B4069Bu, 0x6988736Du, 0x695D041Du, 0x6931B880u,
-		0x69069069u, 0x68DB8BACu, 0x68B0AA1Fu, 0x6885EB95u,
-		0x685B4FE5u, 0x6830D6E4u, 0x68068068u, 0x67DC4C45u,
-		0x67B23A54u, 0x67884A69u, 0x675E7C5Du, 0x6734D006u,
-		0x670B453Bu, 0x66E1DBD4u, 0x66B893A9u, 0x668F6C91u,
-		0x66666666u, 0x663D80FFu, 0x6614BC36u, 0x65EC17E3u,
-		0x65C393E0u, 0x659B3006u, 0x6572EC2Fu, 0x654AC835u,
-		0x6522C3F3u, 0x64FADF42u, 0x64D3199Eu, 0x64AB7401u,
-		0x6483ED27u, 0x645C854Au, 0x64353C48u, 0x640E11FAu,
-		0x63E7063Eu, 0x63C018F0u, 0x639949EBu, 0x6372990Eu,
-		0x634C0634u, 0x6325913Cu, 0x62FF3A01u, 0x62D90062u,
-		0x62B2E43Du, 0x628CE570u, 0x626703D8u, 0x62413F54u,
-		0x621B97C2u, 0x61F60D02u, 0x61D09EF3u, 0x61AB4D72u,
-		0x61861861u, 0x6160FF9Eu, 0x613C0309u, 0x61172283u,
-		0x60F25DEAu, 0x60CDB520u, 0x60A92806u, 0x6084B67Au,
-		0x60606060u, 0x603C2597u, 0x60180601u, 0x5FF4017Fu,
-		0x5FD017F4u, 0x5FAC493Fu, 0x5F889545u, 0x5F64FBE6u,
-		0x5F417D05u, 0x5F1E1885u, 0x5EFACE48u, 0x5ED79E31u,
-		0x5EB48823u, 0x5E918C01u, 0x5E6EA9AEu, 0x5E4BE10Fu,
-		0x5E293205u, 0x5E069C77u, 0x5DE42046u, 0x5DC1BD58u,
-		0x5D9F7390u, 0x5D7D42D4u, 0x5D5B2B08u, 0x5D392C10u,
-		0x5D1745D1u, 0x5CF57831u, 0x5CD3C315u, 0x5CB22661u,
-		0x5C90A1FDu, 0x5C6F35CCu, 0x5C4DE1B6u, 0x5C2CA5A0u,
-		0x5C0B8170u, 0x5BEA750Cu, 0x5BC9805Bu, 0x5BA8A344u,
-		0x5B87DDADu, 0x5B672F7Cu, 0x5B46989Au, 0x5B2618ECu,
-		0x5B05B05Bu, 0x5AE55ECDu, 0x5AC5242Au, 0x5AA5005Au,
-		0x5A84F345u, 0x5A64FCD2u, 0x5A451CEAu, 0x5A255374u,
-		0x5A05A05Au, 0x59E60382u, 0x59C67CD8u, 0x59A70C41u,
-		0x5987B1A9u, 0x59686CF7u, 0x59493E14u, 0x592A24EBu,
-		0x590B2164u, 0x58EC3368u, 0x58CD5AE2u, 0x58AE97BAu,
-		0x588FE9DCu, 0x58715130u, 0x5852CDA0u, 0x58345F18u,
-		0x58160581u, 0x57F7C0C5u, 0x57D990D0u, 0x57BB758Cu,
-		0x579D6EE3u, 0x577F7CC0u, 0x57619F0Fu, 0x5743D5BBu,
-		0x572620AEu, 0x57087FD4u, 0x56EAF319u, 0x56CD7A67u,
-		0x56B015ACu, 0x5692C4D1u, 0x567587C4u, 0x56585E70u,
-		0x563B48C2u, 0x561E46A4u, 0x56015805u, 0x55E47CD0u,
-		0x55C7B4F1u, 0x55AB0055u, 0x558E5EE9u, 0x5571D09Au,
-		0x55555555u, 0x5538ED06u, 0x551C979Au, 0x55005500u,
-		0x54E42523u, 0x54C807F2u, 0x54ABFD5Au, 0x54900549u,
-		0x54741FABu, 0x54584C70u, 0x543C8B84u, 0x5420DCD6u,
-		0x54054054u, 0x53E9B5EBu, 0x53CE3D8Bu, 0x53B2D721u,
-		0x5397829Cu, 0x537C3FEBu, 0x53610EFBu, 0x5345EFBCu,
-		0x532AE21Cu, 0x530FE60Bu, 0x52F4FB76u, 0x52DA224Eu,
-		0x52BF5A81u, 0x52A4A3FEu, 0x5289FEB5u, 0x526F6A96u,
-		0x5254E78Eu, 0x523A758Fu, 0x52201488u, 0x5205C467u,
-		0x51EB851Eu, 0x51D1569Cu, 0x51B738D1u, 0x519D2BADu,
-		0x51832F1Fu, 0x51694319u, 0x514F678Bu, 0x51359C64u,
-		0x511BE195u, 0x5102370Fu, 0x50E89CC2u, 0x50CF129Fu,
-		0x50B59897u, 0x509C2E9Au, 0x5082D499u, 0x50698A85u,
-		0x50505050u, 0x503725EAu, 0x501E0B44u, 0x50050050u,
-		0x4FEC04FEu, 0x4FD31941u, 0x4FBA3D0Au, 0x4FA1704Au,
-		0x4F88B2F3u, 0x4F7004F7u, 0x4F576646u, 0x4F3ED6D4u,
-		0x4F265691u, 0x4F0DE571u, 0x4EF58364u, 0x4EDD305Du,
-		0x4EC4EC4Eu, 0x4EACB72Au, 0x4E9490E1u, 0x4E7C7968u,
-		0x4E6470B0u, 0x4E4C76ABu, 0x4E348B4Du, 0x4E1CAE88u,
-		0x4E04E04Eu, 0x4DED2092u, 0x4DD56F47u, 0x4DBDCC5Fu,
-		0x4DA637CFu, 0x4D8EB188u, 0x4D77397Eu, 0x4D5FCFA4u,
-		0x4D4873ECu, 0x4D31264Bu, 0x4D19E6B3u, 0x4D02B518u,
-		0x4CEB916Du, 0x4CD47BA5u, 0x4CBD73B5u, 0x4CA67990u,
-		0x4C8F8D28u, 0x4C78AE73u, 0x4C61DD63u, 0x4C4B19EDu,
-		0x4C346404u, 0x4C1DBB9Du, 0x4C0720ABu, 0x4BF09322u,
-		0x4BDA12F6u, 0x4BC3A01Cu, 0x4BAD3A87u, 0x4B96E22Du,
-		0x4B809701u, 0x4B6A58F7u, 0x4B542804u, 0x4B3E041Du,
-		0x4B27ED36u, 0x4B11E343u, 0x4AFBE639u, 0x4AE5F60Du,
-		0x4AD012B4u, 0x4ABA3C21u, 0x4AA4724Bu, 0x4A8EB526u,
-		0x4A7904A7u, 0x4A6360C3u, 0x4A4DC96Eu, 0x4A383E9Fu,
-		0x4A22C04Au, 0x4A0D4E64u, 0x49F7E8E2u, 0x49E28FBAu,
-		0x49CD42E2u, 0x49B8024Du, 0x49A2CDF3u, 0x498DA5C8u,
-		0x497889C2u, 0x496379D6u, 0x494E75FAu, 0x49397E24u,
-		0x49249249u, 0x490FB25Fu, 0x48FADE5Cu, 0x48E61636u,
-		0x48D159E2u, 0x48BCA957u, 0x48A8048Au, 0x48936B72u,
-		0x487EDE04u, 0x486A5C37u, 0x4855E601u, 0x48417B57u,
-		0x482D1C31u, 0x4818C884u, 0x48048048u, 0x47F04371u,
-		0x47DC11F7u, 0x47C7EBCFu, 0x47B3D0F1u, 0x479FC154u,
-		0x478BBCECu, 0x4777C3B2u, 0x4763D59Cu, 0x474FF2A1u,
-		0x473C1AB6u, 0x47284DD4u, 0x47148BF0u, 0x4700D502u,
-		0x46ED2901u, 0x46D987E3u, 0x46C5F19Fu, 0x46B2662Du,
-		0x469EE584u, 0x468B6F9Au, 0x46780467u, 0x4664A3E2u,
-		0x46514E02u, 0x463E02BEu, 0x462AC20Eu, 0x46178BE9u,
-		0x46046046u, 0x45F13F1Cu, 0x45DE2864u, 0x45CB1C14u,
-		0x45B81A25u, 0x45A5228Cu, 0x45923543u, 0x457F5241u,
-		0x456C797Du, 0x4559AAF0u, 0x4546E68Fu, 0x45342C55u,
-		0x45217C38u, 0x450ED630u, 0x44FC3A34u, 0x44E9A83Eu,
-		0x44D72044u, 0x44C4A23Fu, 0x44B22E27u, 0x449FC3F4u,
-		0x448D639Du, 0x447B0D1Bu, 0x4468C066u, 0x44567D76u,
-		0x44444444u, 0x443214C7u, 0x441FEEF8u, 0x440DD2CEu,
-		0x43FBC043u, 0x43E9B74Fu, 0x43D7B7EAu, 0x43C5C20Du,
-		0x43B3D5AFu, 0x43A1F2CAu, 0x43901956u, 0x437E494Bu,
-		0x436C82A2u, 0x435AC553u, 0x43491158u, 0x433766A9u,
-		0x4325C53Eu, 0x43142D11u, 0x43029E1Au, 0x42F11851u,
-		0x42DF9BB0u, 0x42CE2830u, 0x42BCBDC8u, 0x42AB5C73u,
-		0x429A0429u, 0x4288B4E3u, 0x42776E9Au, 0x42663147u,
-		0x4254FCE4u, 0x4243D168u, 0x4232AECDu, 0x4221950Du,
-		0x42108421u, 0x41FF7C01u, 0x41EE7CA6u, 0x41DD860Bu,
-		0x41CC9829u, 0x41BBB2F8u, 0x41AAD671u, 0x419A0290u,
-		0x4189374Bu, 0x4178749Eu, 0x4167BA81u, 0x415708EEu,
-		0x41465FDFu, 0x4135BF4Cu, 0x41252730u, 0x41149783u,
-		0x41041041u, 0x40F39161u, 0x40E31ADEu, 0x40D2ACB1u,
-		0x40C246D4u, 0x40B1E941u, 0x40A193F1u, 0x409146DFu,
-		0x40810204u, 0x4070C559u, 0x406090D9u, 0x4050647Du,
-		0x40404040u, 0x4030241Bu, 0x40201008u, 0x40100401u,
-	};
-
+	// runtime and consteval paths.
 public:
 	// ------------------------------------------------------------------
 	// Default constructor — zero
@@ -1466,8 +1552,10 @@ public:
 		if (UNLIKELY(bbe == 0u)) return a;
 
 		int d = static_cast<int>(abe) - static_cast<int>(bbe);
-		if (UNLIKELY(d >= 30)) return a;
-		if (UNLIKELY(d <= -30)) return b;
+                if (UNLIKELY(static_cast<uint32_t>(d + 30) >= 60u)) {
+                        if (d >= 30) return a;
+                        return b; // d <= -30
+                }
 
 		uint32_t am = mant_from_bits(ab);
 		uint32_t bm = mant_from_bits(bb);
@@ -1483,12 +1571,14 @@ public:
 			// most a single down-shift (no CLZ renormalize).
 			return finish_add_samesign(am + bm, re, an);
 		}
-		// Different signs: unsigned subtract (larger - smaller).  Cancellation
-		// can shrink the result, so the general (CLZ) finalizer is required.
+                // Different signs: subtract smaller from larger.
+                // Use finish_sub_mag (no overflow check needed for subtraction;
+                // the result can never exceed the Q29 interval, only shrink
+                // from cancellation).
 		if (am >= bm)
-			return finish_addsub_u(am - bm, re, an);
+                        return finish_sub_mag(am - bm, re, an);
 		else
-			return finish_addsub_u(bm - am, re, bn);
+                        return finish_sub_mag(bm - am, re, bn);
 	}
 	[[nodiscard]] constexpr SF_HOT SF_INLINE SF_FLATTEN
 		friend SoftFloat operator+(SoftFloat a, float b) noexcept {
@@ -1607,7 +1697,7 @@ public:
 	}
 
 	// =========================================================================
-	// operator/ — unified: recip32 + one multiply
+	// operator/ — hardware-udiv mantissa division (Cortex-M3 fast path)
 	// =========================================================================
 	[[nodiscard]] constexpr SF_HOT SoftFloat operator/(SoftFloat rhs) const noexcept
 	{
@@ -1639,8 +1729,7 @@ public:
 
 		// Cortex-M3 has a hardware integer divider (udiv/sdiv).  Computing the
 		// Q30 mantissa quotient with two hardware divides (qfplib-m3 style:
-		// udiv + mul + sdiv) is faster than the reciprocal-table + 2x UMULL
-		// Newton-Raphson path, and is accurate to ~30 bits (<= 1 ULP at Q30,
+		// udiv + mul + sdiv) is accurate to ~30 bits (<= 1 ULP at Q30,
 		// far better than the 24-bit float target).
 		//   qm = floor(ua * 2^30 / ub),  ua,ub in [2^29, 2^30)  =>  qm in (2^29, 2^31)
 		// Stage 1: divide by a rounded 16-bit divisor approximation.
@@ -1695,7 +1784,7 @@ public:
 	}
 
 	// ------------------------------------------------------------------
-	// reciprocal — 1/x via recip32, O(1)
+	// reciprocal — 1/x via hardware-udiv mantissa division, O(1)
 	// ------------------------------------------------------------------
 	[[nodiscard]] constexpr SF_HOT SoftFloat reciprocal() const noexcept
 	{
@@ -2190,59 +2279,6 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 }
 
 // =========================================================================
-// recip32 definition
-// =========================================================================
-[[nodiscard]] constexpr SF_CONST SF_INLINE uint32_t SoftFloat::recip32(uint32_t b) noexcept
-{
-	// Uses the class-member recip_tab (no duplicate local table — saves 2 KB flash
-	// on Cortex-M3 with 0ws flash where every byte of flash matters).
-	// The class member is ODR-usable in all constant expressions.
-
-	uint32_t b2 = b << 1;
-	uint32_t idx = (b2 >> 21) & 0x1FFu;
-	uint32_t Y = recip_tab[idx];
-
-#if defined(__arm__)
-	if (!SF_IS_CONSTEVAL()) {
-		uint32_t lo, hi;
-
-		__asm__(
-			"umull %0, %1, %2, %3"
-			: "=&r"(lo),
-			"=&r"(hi)
-			: "r"(b2),
-			"r"(Y));
-
-		uint32_t q30 = (hi << 2) | (lo >> 30);
-		uint32_t r30 = lo & 0x3FFFFFFFu;
-		int32_t  err = static_cast<int32_t>(0x80000000u - q30 - (r30 ? 1u : 0u));
-
-		uint32_t abs_err = static_cast<uint32_t>(err < 0 ? -err : err);
-		__asm__(
-			"umull %0, %1, %2, %3"
-			: "=&r"(lo),
-			"=&r"(hi)
-			: "r"(Y),
-			"r"(abs_err));
-		uint32_t dY_mag = (hi << 1) | (lo >> 31);
-		int32_t  dY = (err < 0) ? -static_cast<int32_t>(dY_mag)
-			: static_cast<int32_t>(dY_mag);
-
-		uint32_t result = Y;
-		if (dY < 0) result -= static_cast<uint32_t>(-dY);
-		else        result += static_cast<uint32_t>(dY);
-		return result;
-	}
-#endif
-
-	uint64_t bY = static_cast<uint64_t>(b2) * Y;
-	int64_t  err64 = static_cast<int64_t>(1ULL << 61) - static_cast<int64_t>(bY);
-	int32_t  err = static_cast<int32_t>(err64 >> 30);
-	int64_t  dY64 = (static_cast<int64_t>(Y) * err) >> 31;
-	return static_cast<uint32_t>(static_cast<int64_t>(Y) + dY64);
-}
-
-// =========================================================================
 // Fused arithmetic — constexpr (implicitly inline since constexpr)
 // =========================================================================
 
@@ -2261,32 +2297,44 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	// Product sign = b.negative XOR c.negative.
 	uint16_t bc_neg = SoftFloat::sign_from_bits(bb ^ cb);
 	uint32_t pm_u = SoftFloat::mul24_to_q29(SoftFloat::mant24_from_bits(bb), SoftFloat::mant24_from_bits(cb));
-	int32_t pe = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS);
 
 	// Branchless overflow normalisation for product
 	uint32_t ov = pm_u >> 30;
 	pm_u >>= ov;
-	pe += static_cast<int32_t>(ov);
 
-	int d = SoftFloat::exp_from_biased(abe) - pe;
-	if (UNLIKELY(d >= 30)) return a;
-	if (UNLIKELY(d <= -30)) return SoftFloat::finish_addsub_u(pm_u, pe, bc_neg);
+        // Compute exponent difference directly, deferring pe computation.
+        // d = (abe - EXP_BIAS) - (bbe + cbe - 2*EXP_BIAS + MANT_BITS + ov)
+        //   = abe - (bbe + cbe) + (EXP_BIAS - MANT_BITS) - ov
+        int d = static_cast<int>(abe) - static_cast<int>(bbe + cbe)
+              + (SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) - static_cast<int>(ov);
+        // Combined range check: (unsigned)(d + 30) >= 60 catches both
+        // d >= 30 and d < -30 in a single comparison (saves 1 instruction
+        // on the hot path vs two separate checks).
+        if (UNLIKELY(static_cast<uint32_t>(d + 30) >= 60u)) {
+                if (d >= 30) return a;
+                // d <= -30
+                int32_t pe = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
+                return SoftFloat::finish_addsub_u(pm_u, pe, bc_neg);
+        }
 
 	uint32_t am_u = SoftFloat::mant_from_bits(ab);
 	const uint16_t an = SoftFloat::sign_from_bits(ab);
 
 	int32_t re;
 	if (d >= 0) { pm_u >>= d; re = SoftFloat::exp_from_biased(abe); }
-	else { am_u >>= -d; re = pe; }
+        else {
+                am_u >>= -d;
+                re = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
+        }
 
 	// Unsigned add/sub with sign tracking — mirrors operator+ logic
 	if (an == bc_neg) {
 		return SoftFloat::finish_add_samesign(am_u + pm_u, re, an);
 	}
 	if (am_u >= pm_u)
-		return SoftFloat::finish_addsub_u(am_u - pm_u, re, an);
+                return SoftFloat::finish_sub_mag(am_u - pm_u, re, an);
 	else
-		return SoftFloat::finish_addsub_u(pm_u - am_u, re, bc_neg);
+                return SoftFloat::finish_sub_mag(pm_u - am_u, re, bc_neg);
 }
 
 [[nodiscard]] constexpr SF_HOT SoftFloat fused_mul_sub(SoftFloat a, SoftFloat b, SoftFloat c) noexcept {
@@ -2302,30 +2350,38 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	// a - b*c: product sign = b.negative XOR c.negative XOR 1 (negated product)
 	uint16_t bc_neg = static_cast<uint16_t>(SoftFloat::sign_from_bits(bb ^ cb) ^ 1u);
 	uint32_t pm_u = SoftFloat::mul24_to_q29(SoftFloat::mant24_from_bits(bb), SoftFloat::mant24_from_bits(cb));
-	int32_t pe = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS);
 
 	uint32_t ov = pm_u >> 30;
 	pm_u >>= ov;
-	pe += static_cast<int32_t>(ov);
 
-	int d = SoftFloat::exp_from_biased(abe) - pe;
-	if (UNLIKELY(d >= 30)) return a;
-	if (UNLIKELY(d <= -30)) return SoftFloat::finish_addsub_u(pm_u, pe, bc_neg);
+        // Compute d directly, deferring pe (same optimization as fused_mul_add)
+        int d = static_cast<int>(abe) - static_cast<int>(bbe + cbe)
+              + (SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) - static_cast<int>(ov);
+        // Combined range check (same as fused_mul_add)
+        if (UNLIKELY(static_cast<uint32_t>(d + 30) >= 60u)) {
+                if (d >= 30) return a;
+                // d <= -30
+                int32_t pe = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
+                return SoftFloat::finish_addsub_u(pm_u, pe, bc_neg);
+        }
 
 	uint32_t am_u = SoftFloat::mant_from_bits(ab);
 	const uint16_t an = SoftFloat::sign_from_bits(ab);
 
 	int32_t re;
 	if (d >= 0) { pm_u >>= d; re = SoftFloat::exp_from_biased(abe); }
-	else { am_u >>= -d; re = pe; }
+        else {
+                am_u >>= -d;
+                re = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
+        }
 
 	if (an == bc_neg) {
 		return SoftFloat::finish_add_samesign(am_u + pm_u, re, an);
 	}
 	if (am_u >= pm_u)
-		return SoftFloat::finish_addsub_u(am_u - pm_u, re, an);
+                return SoftFloat::finish_sub_mag(am_u - pm_u, re, an);
 	else
-		return SoftFloat::finish_addsub_u(pm_u - am_u, re, bc_neg);
+                return SoftFloat::finish_sub_mag(pm_u - am_u, re, bc_neg);
 }
 
 [[nodiscard]] constexpr SF_HOT SoftFloat fused_mul_mul_add(SoftFloat a, SoftFloat b, SoftFloat c, SoftFloat d) noexcept {
@@ -2381,10 +2437,11 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	if (neg1 == neg2) {
 		return SoftFloat::finish_add_samesign(pm1 + pm2, re, neg1);
 	}
+        // Different signs: use finish_sub_mag (no overflow check needed)
 	if (pm1 >= pm2)
-		return SoftFloat::finish_addsub_u(pm1 - pm2, re, neg1);
+                return SoftFloat::finish_sub_mag(pm1 - pm2, re, neg1);
 	else
-		return SoftFloat::finish_addsub_u(pm2 - pm1, re, neg2);
+                return SoftFloat::finish_sub_mag(pm2 - pm1, re, neg2);
 }
 
 [[nodiscard]] constexpr SF_HOT SoftFloat fused_mul_mul_sub(SoftFloat a, SoftFloat b,
@@ -2430,9 +2487,10 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 
 	if (neg1 == neg2)
 		return SoftFloat::finish_add_samesign(pm1 + pm2, re, neg1);
+        // Different signs: use finish_sub_mag (no overflow check needed)
 	if (pm1 >= pm2)
-		return SoftFloat::finish_addsub_u(pm1 - pm2, re, neg1);
-	return SoftFloat::finish_addsub_u(pm2 - pm1, re, neg2);
+                return SoftFloat::finish_sub_mag(pm1 - pm2, re, neg1);
+        return SoftFloat::finish_sub_mag(pm2 - pm1, re, neg2);
 }
 
 // =========================================================================
@@ -3015,41 +3073,6 @@ constexpr SF_HOT SoftFloat SoftFloat::sqrt() const noexcept
 constexpr SF_HOT Angle atan2(SoftFloat y, SoftFloat x) noexcept
 {
 
-	static constexpr uint32_t ATAN_RAW_TAB[258] = {
-		0x00000000u, 0x0028BE53u, 0x00517C55u, 0x007A39B4u, 0x00A2F61Eu, 0x00CBB143u, 0x00F46AD1u, 0x011D2276u,
-		0x0145D7E1u, 0x016E8AC2u, 0x01973AC8u, 0x01BFE7A1u, 0x01E890FDu, 0x0211368Bu, 0x0239D7FCu, 0x026274FEu,
-		0x028B0D43u, 0x02B3A07Au, 0x02DC2E54u, 0x0304B681u, 0x032D38B4u, 0x0355B49Cu, 0x037E29EBu, 0x03A69855u,
-		0x03CEFF8Au, 0x03F75F3Du, 0x041FB721u, 0x044806EAu, 0x04704E4Bu, 0x04988CF8u, 0x04C0C2A5u, 0x04E8EF07u,
-		0x051111D4u, 0x05392AC1u, 0x05613984u, 0x05893DD4u, 0x05B13767u, 0x05D925F6u, 0x06010937u, 0x0628E0E5u,
-		0x0650ACB7u, 0x06786C67u, 0x06A01FAFu, 0x06C7C649u, 0x06EF5FF2u, 0x0716EC63u, 0x073E6B5Bu, 0x0765DC95u,
-		0x078D3FCFu, 0x07B494C6u, 0x07DBDB3Au, 0x080312EAu, 0x082A3B95u, 0x085154FCu, 0x08785EDFu, 0x089F5902u,
-		0x08C64325u, 0x08ED1D0Du, 0x0913E67Cu, 0x093A9F37u, 0x09614704u, 0x0987DDA7u, 0x09AE62E7u, 0x09D4D68Bu,
-		0x09FB385Bu, 0x0A218820u, 0x0A47C5A2u, 0x0A6DF0ACu, 0x0A940907u, 0x0ABA0E80u, 0x0AE000E2u, 0x0B05DFFAu,
-		0x0B2BAB95u, 0x0B516382u, 0x0B770790u, 0x0B9C978Du, 0x0BC2134Cu, 0x0BE77A9Bu, 0x0C0CCD4Fu, 0x0C320B38u,
-		0x0C57342Bu, 0x0C7C47FBu, 0x0CA1467Du, 0x0CC62F87u, 0x0CEB02EFu, 0x0D0FC08Du, 0x0D346837u, 0x0D58F9C7u,
-		0x0D7D7515u, 0x0DA1D9FCu, 0x0DC62856u, 0x0DEA6000u, 0x0E0E80D4u, 0x0E328AB1u, 0x0E567D73u, 0x0E7A58FAu,
-		0x0E9E1D24u, 0x0EC1C9D1u, 0x0EE55EE3u, 0x0F08DC39u, 0x0F2C41B7u, 0x0F4F8F3Fu, 0x0F72C4B4u, 0x0F95E1FBu,
-		0x0FB8E6F9u, 0x0FDBD394u, 0x0FFEA7B1u, 0x10216337u, 0x1044060Fu, 0x10669021u, 0x10890156u, 0x10AB5998u,
-		0x10CD98D1u, 0x10EFBEEDu, 0x1111CBD6u, 0x1133BF7Au, 0x115599C7u, 0x11775AA8u, 0x1199020Eu, 0x11BA8FE7u,
-		0x11DC0423u, 0x11FD5EB3u, 0x121E9F86u, 0x123FC690u, 0x1260D3C2u, 0x1281C70Fu, 0x12A2A06Au, 0x12C35FC8u,
-		0x12E4051Eu, 0x13049060u, 0x13250184u, 0x13455882u, 0x1365954Fu, 0x1385B7E4u, 0x13A5C038u, 0x13C5AE45u,
-		0x13E58204u, 0x14053B6Eu, 0x1424DA7Eu, 0x14445F2Eu, 0x1463C97Au, 0x1483195Fu, 0x14A24ED8u, 0x14C169E2u,
-		0x14E06A7Bu, 0x14FF50A0u, 0x151E1C51u, 0x153CCD8Cu, 0x155B6450u, 0x1579E09Eu, 0x15984275u, 0x15B689D7u,
-		0x15D4B6C5u, 0x15F2C93Fu, 0x1610C149u, 0x162E9EE6u, 0x164C6217u, 0x166A0AE0u, 0x16879946u, 0x16A50D4Cu,
-		0x16C266F7u, 0x16DFA64Cu, 0x16FCCB50u, 0x1719D60Au, 0x1736C67Fu, 0x17539CB6u, 0x177058B6u, 0x178CFA85u,
-		0x17A9822Du, 0x17C5EFB4u, 0x17E24323u, 0x17FE7C82u, 0x181A9BDBu, 0x1836A137u, 0x18528C9Fu, 0x186E5E1Du,
-		0x188A15BCu, 0x18A5B386u, 0x18C13785u, 0x18DCA1C6u, 0x18F7F252u, 0x19132937u, 0x192E4680u, 0x19494A38u,
-		0x1964346Eu, 0x197F052Cu, 0x1999BC81u, 0x19B45A79u, 0x19CEDF22u, 0x19E94A8Au, 0x1A039CBEu, 0x1A1DD5CDu,
-		0x1A37F5C5u, 0x1A51FCB4u, 0x1A6BEAAAu, 0x1A85BFB5u, 0x1A9F7BE5u, 0x1AB91F49u, 0x1AD2A9F0u, 0x1AEC1BEBu,
-		0x1B057548u, 0x1B1EB61Au, 0x1B37DE6Fu, 0x1B50EE58u, 0x1B69E5E6u, 0x1B82C529u, 0x1B9B8C33u, 0x1BB43B15u,
-		0x1BCCD1E0u, 0x1BE550A5u, 0x1BFDB776u, 0x1C160664u, 0x1C2E3D81u, 0x1C465CE0u, 0x1C5E6492u, 0x1C7654A9u,
-		0x1C8E2D38u, 0x1CA5EE52u, 0x1CBD9807u, 0x1CD52A6Cu, 0x1CECA593u, 0x1D04098Fu, 0x1D1B5672u, 0x1D328C4Fu,
-		0x1D49AB3Bu, 0x1D60B347u, 0x1D77A487u, 0x1D8E7F0Fu, 0x1DA542F1u, 0x1DBBF042u, 0x1DD28714u, 0x1DE9077Cu,
-		0x1DFF718Cu, 0x1E15C55Au, 0x1E2C02F8u, 0x1E422A7Au, 0x1E583BF4u, 0x1E6E377Bu, 0x1E841D21u, 0x1E99ECFCu,
-		0x1EAFA71Fu, 0x1EC54B9Eu, 0x1EDADA8Du, 0x1EF05401u, 0x1F05B80Eu, 0x1F1B06C8u, 0x1F304043u, 0x1F456493u,
-		0x1F5A73CDu, 0x1F6F6E05u, 0x1F84534Fu, 0x1F9923C0u, 0x1FADDF6Bu, 0x1FC28667u, 0x1FD718C6u, 0x1FEB969Du,
-		0x20000000u, 0x20000000u
-	};
 
 	// Decode each operand's packed fields exactly once.  Going through the
 	// mantissa/exponent/negative macros re-extracts field_exp(bits) (plus a
@@ -3091,8 +3114,8 @@ constexpr SF_HOT Angle atan2(SoftFloat y, SoftFloat x) noexcept
 	int32_t shift = 24 + num_e - den_e;
 	uint32_t t_Q24;
 
-	// Runtime path: use recip32 multiply to avoid expensive __aeabi_uldivmod.
-	// Consteval path: use plain integer division (recip32 table is not constexpr).
+	// Runtime path: hardware-udiv two-stage quotient (qfplib-m3 style).
+	// Consteval path: plain integer division.
 	if (SF_IS_CONSTEVAL()) {
 		// Consteval fallback: integer division
 		if (LIKELY(shift >= 0)) {
@@ -3135,8 +3158,8 @@ constexpr SF_HOT Angle atan2(SoftFloat y, SoftFloat x) noexcept
 	// Interpolate directly in Angle raw units instead of first producing Q29
 	// radians and then multiplying by 2^31/pi.  This removes one 32x32->64
 	// multiply from the hot path and also avoids a signed intermediate.
-	uint32_t a0 = ATAN_RAW_TAB[idx];
-	uint32_t a1 = ATAN_RAW_TAB[idx + 1];
+        uint32_t a0 = SoftFloat::ATAN_RAW_TAB[idx];
+        uint32_t a1 = SoftFloat::ATAN_RAW_TAB[idx + 1];
 	uint32_t angle_raw = a0 + static_cast<uint32_t>((static_cast<uint64_t>(a1 - a0) * frac) >> 16);
 
 	if (swap)  angle_raw = 0x40000000u - angle_raw;
@@ -3148,73 +3171,6 @@ constexpr SF_HOT Angle atan2(SoftFloat y, SoftFloat x) noexcept
 
 constexpr SF_HOT SoftFloat SoftFloat::exp() const noexcept
 {
-	static constexpr int32_t EXP_MANT[257] = {
-		0x20000000, 0x201635F5, 0x202C7B54, 0x2042D028,
-		0x2059347D, 0x206FA85C, 0x20862BD1, 0x209CBEE6,
-		0x20B361A6, 0x20CA141C, 0x20E0D654, 0x20F7A857,
-		0x210E8A31, 0x21257BED, 0x213C7D96, 0x21538F36,
-		0x216AB0DA, 0x2181E28C, 0x21992457, 0x21B07646,
-		0x21C7D866, 0x21DF4AC0, 0x21F6CD60, 0x220E6052,
-		0x222603A0, 0x223DB757, 0x22557B81, 0x226D502A,
-		0x2285355D, 0x229D2B27, 0x22B53191, 0x22CD48A9,
-		0x22E57079, 0x22FDA90D, 0x2315F271, 0x232E4CB0,
-		0x2346B7D7, 0x235F33F0, 0x2377C108, 0x23905F2A,
-		0x23A90E63, 0x23C1CEBD, 0x23DAA046, 0x23F38308,
-		0x240C7711, 0x24257C6B, 0x243E9323, 0x2457BB45,
-		0x2470F4DD, 0x248A3FF7, 0x24A39C9F, 0x24BD0AE2,
-		0x24D68ACC, 0x24F01C68, 0x2509BFC4, 0x252374EB,
-		0x253D3BEA, 0x255714CE, 0x2570FFA2, 0x258AFC73,
-		0x25A50B4E, 0x25BF2C3F, 0x25D95F52, 0x25F3A495,
-		0x260DFC14, 0x262865DC, 0x2642E1F9, 0x265D7077,
-		0x26781165, 0x2692C4CE, 0x26AD8ABF, 0x26C86346,
-		0x26E34E6E, 0x26FE4C46, 0x27195CDA, 0x27348037,
-		0x274FB66A, 0x276AFF80, 0x27865B86, 0x27A1CA8A,
-		0x27BD4C98, 0x27D8E1BE, 0x27F48A09, 0x28104587,
-		0x282C1444, 0x2847F64E, 0x2863EBB3, 0x287FF47F,
-		0x289C10C1, 0x28B84085, 0x28D483DA, 0x28F0DACD,
-		0x290D456C, 0x2929C3C3, 0x294655E2, 0x2962FBD5,
-		0x297FB5AA, 0x299C8370, 0x29B96534, 0x29D65B04,
-		0x29F364ED, 0x2A1082FF, 0x2A2DB546, 0x2A4AFBD0,
-		0x2A6856AD, 0x2A85C5EA, 0x2AA34995, 0x2AC0E1BC,
-		0x2ADE8E6D, 0x2AFC4FB8, 0x2B1A25A9, 0x2B381050,
-		0x2B560FBB, 0x2B7423F7, 0x2B924D15, 0x2BB08B21,
-		0x2BCEDE2B, 0x2BED4642, 0x2C0BC373, 0x2C2A55CE,
-		0x2C48FD60, 0x2C67BA3A, 0x2C868C6A, 0x2CA573FD,
-		0x2CC47105, 0x2CE3838E, 0x2D02ABA9, 0x2D21E963,
-		0x2D413CCD, 0x2D60A5F5, 0x2D8024EA, 0x2D9FB9BC,
-		0x2DBF6479, 0x2DDF2531, 0x2DFEFBF3, 0x2E1EE8CE,
-		0x2E3EEBD2, 0x2E5F050E, 0x2E7F3491, 0x2E9F7A6C,
-		0x2EBFD6AD, 0x2EE04963, 0x2F00D2A0, 0x2F217271,
-		0x2F4228E8, 0x2F62F613, 0x2F83DA02, 0x2FA4D4C6,
-		0x2FC5E66E, 0x2FE70F09, 0x30084EA8, 0x3029A55C,
-		0x304B1333, 0x306C983D, 0x308E348C, 0x30AFE82F,
-		0x30D1B337, 0x30F395B2, 0x31158FB3, 0x3137A149,
-		0x3159CA84, 0x317C0B76, 0x319E642D, 0x31C0D4BC,
-		0x31E35D32, 0x3205FDA0, 0x3228B617, 0x324B86A7,
-		0x326E6F62, 0x32917057, 0x32B48998, 0x32D7BB35,
-		0x32FB0540, 0x331E67C9, 0x3341E2E2, 0x3365769B,
-		0x33892305, 0x33ACE833, 0x33D0C634, 0x33F4BD1A,
-		0x3418CCF7, 0x343CF5DB, 0x346137D9, 0x34859301,
-		0x34AA0764, 0x34CE9516, 0x34F33C26, 0x3517FCA8,
-		0x353CD6AB, 0x3561CA42, 0x3586D780, 0x35ABFE74,
-		0x35D13F33, 0x35F699CC, 0x361C0E53, 0x36419CD9,
-		0x36674571, 0x368D082B, 0x36B2E51C, 0x36D8DC54,
-		0x36FEEDE6, 0x372519E4, 0x374B6061, 0x3771C16F,
-		0x37983D21, 0x37BED388, 0x37E584B8, 0x380C50C3,
-		0x383337BB, 0x385A39B4, 0x388156C0, 0x38A88EF2,
-		0x38CFE25D, 0x38F75113, 0x391EDB28, 0x394680AF,
-		0x396E41BA, 0x39961E5D, 0x39BE16AB, 0x39E62AB7,
-		0x3A0E5A94, 0x3A36A656, 0x3A5F0E10, 0x3A8791D6,
-		0x3AB031BA, 0x3AD8EDD1, 0x3B01C62E, 0x3B2ABAE4,
-		0x3B53CC08, 0x3B7CF9AC, 0x3BA643E6, 0x3BCFAAC8,
-		0x3BF92E67, 0x3C22CED6, 0x3C4C8C2A, 0x3C766676,
-		0x3CA05DCF, 0x3CCA7249, 0x3CF4A3F8, 0x3D1EF2F0,
-		0x3D495F45, 0x3D73E90D, 0x3D9E905B, 0x3DC95544,
-		0x3DF437DD, 0x3E1F3839, 0x3E4A566F, 0x3E759292,
-		0x3EA0ECB7, 0x3ECC64F3, 0x3EF7FB5B, 0x3F23B004,
-		0x3F4F8303, 0x3F7B746D, 0x3FA78457, 0x3FD3B2D6,
-		0x20000000
-	};
 
 	// Decode the packed fields once instead of through the
 	// mantissa/exponent/negative macros (each re-extracts field_exp + branch).
@@ -3352,8 +3308,8 @@ constexpr SF_HOT SoftFloat SoftFloat::exp() const noexcept
 	const uint32_t idx = u_8_21 >> 21;
 	const int32_t  frac = static_cast<int32_t>(u_8_21 & 0x1FFFFFu);
 
-	const int32_t m0 = EXP_MANT[idx];
-	const int32_t m1 = LIKELY(idx < 255) ? EXP_MANT[idx + 1] : int32_t(0x40000000);
+        const int32_t m0 = SoftFloat::EXP_MANT[idx];
+        const int32_t m1 = LIKELY(idx < 255) ? SoftFloat::EXP_MANT[idx + 1] : int32_t(0x40000000);
 	const int32_t delta = m1 - m0;
 
 	int32_t result_q29;
@@ -3380,73 +3336,6 @@ constexpr SF_HOT SoftFloat SoftFloat::exp() const noexcept
 
 constexpr SF_HOT SoftFloat SoftFloat::log2() const noexcept
 {
-	static constexpr int32_t LOG2_Q30[257] = {
-		0x00000000, 0x005C2711, 0x00B7F285, 0x01136311,
-		0x016E7968, 0x01C9363B, 0x02239A3A, 0x027DA612,
-		0x02D75A6E, 0x0330B7F8, 0x0389BF57, 0x03E27130,
-		0x043ACE27, 0x0492D6DF, 0x04EA8BF7, 0x0541EE0D,
-		0x0598FDBE, 0x05EFBBA5, 0x0646285B, 0x069C4477,
-		0x06F21090, 0x07478D38, 0x079CBB04, 0x07F19A83,
-		0x08462C46, 0x089A70DA, 0x08EE68CB, 0x094214A5,
-		0x099574F1, 0x09E88A36, 0x0A3B54FC, 0x0A8DD5C8,
-		0x0AE00D1C, 0x0B31FB7D, 0x0B83A16A, 0x0BD4FF63,
-		0x0C2615E8, 0x0C76E574, 0x0CC76E83, 0x0D17B191,
-		0x0D67AF16, 0x0DB7678B, 0x0E06DB66, 0x0E560B1E,
-		0x0EA4F726, 0x0EF39FF1, 0x0F4205F3, 0x0F90299C,
-		0x0FDE0B5C, 0x102BABA2, 0x107908DB, 0x10C62975,
-		0x111307DA, 0x115FA676, 0x11AC05B2, 0x11F825F6,
-		0x124407AB, 0x128FAB35, 0x12DB10FC, 0x13263963,
-		0x13712ACE, 0x13BBD3A0, 0x1406463B, 0x14507CFE,
-		0x149A784B, 0x14E43880, 0x152DBDFC, 0x1577091B,
-		0x15C01A39, 0x1608F1B4, 0x16518FE4, 0x1699F524,
-		0x16E221CD, 0x172A1637, 0x1771D2BA, 0x17B957AC,
-		0x1800A563, 0x1847BC33, 0x188E9C72, 0x18D54673,
-		0x191BBA89, 0x1961F905, 0x19A80239, 0x19EDD675,
-		0x1A33760A, 0x1A78E146, 0x1ABE1879, 0x1B031BEF,
-		0x1B47EBF7, 0x1B8C88DB, 0x1BD0F2E9, 0x1C152A6C,
-		0x1C592FAD, 0x1C9D02F6, 0x1CE0A492, 0x1D2414C8,
-		0x1D6753E0, 0x1DAA6222, 0x1DED3FD4, 0x1E2FED3D,
-		0x1E726AA1, 0x1EB4B847, 0x1EF6D673, 0x1F38C567,
-		0x1F7A8568, 0x1FBC16B9, 0x1FFD799A, 0x203EAE4E,
-		0x207FB517, 0x20C08E33, 0x210139E4, 0x2141B869,
-		0x21820A01, 0x21C22EEA, 0x22022762, 0x2241F3A7,
-		0x228193F5, 0x22C10889, 0x2300519E, 0x233F6F71,
-		0x237E623D, 0x23BD2A3B, 0x23FBC7A6, 0x243A3AB7,
-		0x247883A8, 0x24B6A2B1, 0x24F4980B, 0x253263EC,
-		0x2570068E, 0x25AD8026, 0x25EAD0EB, 0x2627F914,
-		0x2664F8D5, 0x26A1D064, 0x26DE7FF6, 0x271B07C0,
-		0x275767F5, 0x2793A0C9, 0x27CFB26F, 0x280B9D1A,
-		0x284760FD, 0x2882FE49, 0x28BE7531, 0x28F9C5E5,
-		0x2934F097, 0x296FF577, 0x29AAD4B6, 0x29E58E83,
-		0x2A20230E, 0x2A5A9285, 0x2A94DD19, 0x2ACF02F7,
-		0x2B09044D, 0x2B42E149, 0x2B7C9A19, 0x2BB62EEA,
-		0x2BEF9FE8, 0x2C28ED40, 0x2C62171E, 0x2C9B1DAE,
-		0x2CD4011C, 0x2D0CC192, 0x2D455F3C, 0x2D7DDA44,
-		0x2DB632D4, 0x2DEE6917, 0x2E267D36, 0x2E5E6F5A,
-		0x2E963FAC, 0x2ECDEE56, 0x2F057B7F, 0x2F3CE751,
-		0x2F7431F2, 0x2FAB5B8B, 0x2FE26443, 0x30194C40,
-		0x305013AB, 0x3086BAA9, 0x30BD4161, 0x30F3A7F8,
-		0x3129EE96, 0x3160155E, 0x31961C76, 0x31CC0404,
-		0x3201CC2C, 0x32377512, 0x326CFEDB, 0x32A269AB,
-		0x32D7B5A5, 0x330CE2ED, 0x3341F1A7, 0x3376E1F5,
-		0x33ABB3FA, 0x33E067D9, 0x3414FDB4, 0x344975AD,
-		0x347DCFE7, 0x34B20C82, 0x34E62BA0, 0x351A2D62,
-		0x354E11EB, 0x3581D959, 0x35B583CE, 0x35E9116A,
-		0x361C824D, 0x364FD697, 0x36830E69, 0x36B629E1,
-		0x36E9291E, 0x371C0C41, 0x374ED367, 0x37817EAF,
-		0x37B40E39, 0x37E68222, 0x3818DA88, 0x384B178A,
-		0x387D3945, 0x38AF3FD7, 0x38E12B5D, 0x3912FBF4,
-		0x3944B1B9, 0x39764CC9, 0x39A7CD41, 0x39D9333D,
-		0x3A0A7EDA, 0x3A3BB033, 0x3A6CC764, 0x3A9DC48A,
-		0x3ACEA7C0, 0x3AFF7121, 0x3B3020C8, 0x3B60B6D1,
-		0x3B913356, 0x3BC19672, 0x3BF1E041, 0x3C2210DB,
-		0x3C52285C, 0x3C8226DD, 0x3CB20C79, 0x3CE1D948,
-		0x3D118D66, 0x3D4128EB, 0x3D70ABF1, 0x3DA01691,
-		0x3DCF68E3, 0x3DFEA301, 0x3E2DC503, 0x3E5CCF02,
-		0x3E8BC117, 0x3EBA9B59, 0x3EE95DE1, 0x3F1808C7,
-		0x3F469C22, 0x3F75180B, 0x3FA37C98, 0x3FD1C9E2,
-		0x40000000
-	};
 
 	if (UNLIKELY(mantissa == 0 || negative)) return zero();
 
@@ -3457,8 +3346,8 @@ constexpr SF_HOT SoftFloat SoftFloat::log2() const noexcept
 	uint32_t t_int = low >> 21;
 	uint32_t frac = (low >> 13) & 0xFFu;
 
-	int32_t v0 = LOG2_Q30[t_int];
-	int32_t v1 = LOG2_Q30[t_int + 1];
+        int32_t v0 = SoftFloat::LOG2_Q30[t_int];
+        int32_t v1 = SoftFloat::LOG2_Q30[t_int + 1];
 
 	int32_t delta = v1 - v0;
 	// Use int64_t for the interpolation multiply to avoid any potential overflow
