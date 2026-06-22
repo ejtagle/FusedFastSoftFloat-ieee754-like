@@ -2287,10 +2287,9 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	if (UNLIKELY((bbe == 0u) | (cbe == 0u))) return a;
 	if (UNLIKELY(abe == 0u)) return SoftFloat::mul_plain(b, c);
 
-	// Use unsigned mantissa multiply + separate sign tracking.
-	// Avoids 2 conditional negates (sign-encode of b,c) present in the old code.
-	// Product sign = b.negative XOR c.negative.
-	uint16_t bc_neg = SoftFloat::sign_from_bits(bb ^ cb);
+	// Compute product sign as a full-word mask (0 or 0x80000000).
+	// This avoids a MOV.LSR to extract the 1-bit sign into a register.
+	uint32_t bc_sign = (bb ^ cb) & 0x80000000u;
 	uint32_t pm_u = SoftFloat::mul24_to_q29(SoftFloat::mant24_from_bits(bb), SoftFloat::mant24_from_bits(cb));
 
 	// Branchless overflow normalisation for product
@@ -2318,11 +2317,23 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
                 if (d >= 30) return a;
                 // d <= -30
                 int32_t pe = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
-                return SoftFloat::finish_addsub_u(pm_u, pe, bc_neg);
+		return SoftFloat::finish_addsub_u(pm_u, pe, static_cast<uint16_t>(bc_sign >> 31));
         }
 
-	uint32_t am_u = SoftFloat::mant_from_bits(ab);
-	const uint16_t an = SoftFloat::sign_from_bits(ab);
+	uint32_t a_sign = ab & 0x80000000u;
+	uint32_t am_u;
+#if defined(__arm__)
+	if (!SF_IS_CONSTEVAL()) {
+		__asm__(
+		    "ubfx %[m], %[ab], #0, #23\n\t"
+		    "lsl  %[m], %[m], #6\n\t"
+		    "orr  %[m], %[m], #0x20000000"
+		    : [m] "=r"(am_u)
+		    : [ab] "r"(ab)
+		);
+	} else
+#endif
+		am_u = SoftFloat::mant_from_bits(ab);
 
 	int32_t re;
         if (d >= 0) { pm_u >>= d; re = ae; }
@@ -2331,14 +2342,16 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
                 re = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
         }
 
-	// Unsigned add/sub with sign tracking — mirrors operator+ logic
-	if (an == bc_neg) {
-		return SoftFloat::finish_add_samesign(am_u + pm_u, re, an);
+	// Same-sign check: XOR the sign masks and test bit 31.
+	// This replaces 2x MOV.LSR + CMP with EOR + TST.
+	bool same_sign = ((bc_sign ^ a_sign) == 0u);
+	if (same_sign) {
+		return SoftFloat::finish_add_samesign(am_u + pm_u, re, static_cast<uint16_t>(a_sign >> 31));
 	}
 	if (am_u >= pm_u)
-                return SoftFloat::finish_sub_mag(am_u - pm_u, re, an);
+		return SoftFloat::finish_sub_mag(am_u - pm_u, re, static_cast<uint16_t>(a_sign >> 31));
 	else
-                return SoftFloat::finish_sub_mag(pm_u - am_u, re, bc_neg);
+		return SoftFloat::finish_sub_mag(pm_u - am_u, re, static_cast<uint16_t>(bc_sign >> 31));
 }
 
 [[nodiscard]] constexpr SF_HOT SoftFloat fused_mul_sub(SoftFloat a, SoftFloat b, SoftFloat c) noexcept {
@@ -2351,8 +2364,8 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	if (UNLIKELY((bbe == 0u) | (cbe == 0u))) return a;
 	if (UNLIKELY(abe == 0u)) return -SoftFloat::mul_plain(b, c);
 
-	// a - b*c: product sign = b.negative XOR c.negative XOR 1 (negated product)
-	uint16_t bc_neg = static_cast<uint16_t>(SoftFloat::sign_from_bits(bb ^ cb) ^ 1u);
+	// a - b*c: product sign is INVERTED from b^c (negated product)
+	uint32_t bc_sign = ((bb ^ cb) ^ 0x80000000u) & 0x80000000u;
 	uint32_t pm_u = SoftFloat::mul24_to_q29(SoftFloat::mant24_from_bits(bb), SoftFloat::mant24_from_bits(cb));
 
 	uint32_t ov = pm_u >> 30;
@@ -2368,11 +2381,23 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
                 if (d >= 30) return a;
                 // d <= -30
                 int32_t pe = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
-                return SoftFloat::finish_addsub_u(pm_u, pe, bc_neg);
+		return SoftFloat::finish_addsub_u(pm_u, pe, static_cast<uint16_t>(bc_sign >> 31));
         }
 
-	uint32_t am_u = SoftFloat::mant_from_bits(ab);
-	const uint16_t an = SoftFloat::sign_from_bits(ab);
+	uint32_t a_sign = ab & 0x80000000u;
+	uint32_t am_u;
+#if defined(__arm__)
+	if (!SF_IS_CONSTEVAL()) {
+		__asm__(
+		    "ubfx %[m], %[ab], #0, #23\n\t"
+		    "lsl  %[m], %[m], #6\n\t"
+		    "orr  %[m], %[m], #0x20000000"
+		    : [m] "=r"(am_u)
+		    : [ab] "r"(ab)
+		);
+	} else
+#endif
+		am_u = SoftFloat::mant_from_bits(ab);
 
 	int32_t re;
         if (d >= 0) { pm_u >>= d; re = ae; }
@@ -2381,13 +2406,14 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
                 re = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
         }
 
-	if (an == bc_neg) {
-		return SoftFloat::finish_add_samesign(am_u + pm_u, re, an);
+	bool same_sign = ((bc_sign ^ a_sign) == 0u);
+	if (same_sign) {
+		return SoftFloat::finish_add_samesign(am_u + pm_u, re, static_cast<uint16_t>(a_sign >> 31));
 	}
 	if (am_u >= pm_u)
-                return SoftFloat::finish_sub_mag(am_u - pm_u, re, an);
+		return SoftFloat::finish_sub_mag(am_u - pm_u, re, static_cast<uint16_t>(a_sign >> 31));
 	else
-                return SoftFloat::finish_sub_mag(pm_u - am_u, re, bc_neg);
+		return SoftFloat::finish_sub_mag(pm_u - am_u, re, static_cast<uint16_t>(bc_sign >> 31));
 }
 
 [[nodiscard]] constexpr SF_HOT SoftFloat fused_mul_mul_add(SoftFloat a, SoftFloat b, SoftFloat c, SoftFloat d) noexcept {
