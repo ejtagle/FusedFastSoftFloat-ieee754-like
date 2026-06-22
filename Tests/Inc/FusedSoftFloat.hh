@@ -22,7 +22,8 @@
 #include <cstdint>
 
 // If defined, will force inline everything, otherwise, only inlines hot path
-#undef MAXIMUM_SPEED
+#define MAXIMUM_SPEED
+#define SF_ALLOW_INLINE_PUBLIC
 
 #ifndef INT_MAX
 #   define INT_MAX 2147483647
@@ -67,6 +68,30 @@
 #   define LIKELY(x)    (x)
 #   define UNLIKELY(x)  (x)
 #   define IS_CONST(x)  0
+#endif
+
+// SF_NOINLINE: prevents the compiler from inlining a function.
+// Used on the public API (operator+, operator-, mul_plain, sqrt, etc.) so
+// that the head-to-head benchmark against qfplib-m3 is fair: qfplib is a
+// separate .s file and can never be inlined, so it always pays call+return
+// overhead.  Without SF_NOINLINE, GCC inlines the SF operators into the
+// benchmark loop, giving SF an artificial advantage (no call overhead,
+// constant hoisting across the function boundary).
+//
+// Internal helpers (pack_q25, finish_add_q25, mant25_from_bits, etc.) stay
+// SF_INLINE so they don't add call overhead to the noinlined public API.
+//
+// This can be disabled for production builds where maximum speed is desired
+// and FLASH space is not a concern: define SF_ALLOW_INLINE_PUBLIC to make
+// SF_NOINLINE a no-op.
+#ifdef SF_ALLOW_INLINE_PUBLIC
+#   define SF_NOINLINE
+#else
+#   if defined(__GNUC__) || defined(__clang__)
+#       define SF_NOINLINE  __attribute__((noinline))
+#   else
+#       define SF_NOINLINE
+#   endif
 #endif
 
 
@@ -497,6 +522,15 @@ private:
 		return 0x00800000u | (v & 0x007FFFFFu);
 	}
 	[[nodiscard]] static constexpr SF_CONST SF_INLINE uint32_t mant_from_bits(uint32_t v) noexcept {
+                // Returns the Q29 working mantissa: implicit-1 at bit 29 + 23-bit
+                // IEEE mantissa field left-shifted to bit 6 (so the mantissa value
+                // lives in [2^29, 2^30)).
+                //
+                // On ARM this is 2 instructions: `lsl r, r, #6` (which shifts the
+                // 23-bit mantissa up, dropping the sign+exp bits as zero) followed
+                // by `orr r, r, #0x20000000` (set the implicit-1).  GCC's existing
+                // codegen for the C++ expression is already that, so no inline-asm
+                // override is needed.
 		return 0x20000000u | ((v & 0x007FFFFFu) << 6);
 	}
 	[[nodiscard]] static constexpr SF_CONST SF_INLINE int32_t exp_from_biased(uint32_t be) noexcept {
@@ -505,6 +539,169 @@ private:
 	[[nodiscard]] static constexpr SF_CONST SF_INLINE uint16_t sign_from_bits(uint32_t v) noexcept {
 		return static_cast<uint16_t>(v >> 31);
 	}
+
+        // -----------------------------------------------------------------
+        // Q25 mantissa helpers (used by the Q25 add/sub fast path).
+        //
+        // Q25 representation:
+        //   bit 24    = implicit-1
+        //   bits 23:1 = 23-bit IEEE fraction (shifted left by 1 from IEEE pos)
+        //   bit 0     = 0 (reserved for round bit during alignment shifts)
+        //   Range: [2^24, 2^25) = [0x01000000, 0x02000000)
+        //
+        // Why Q25 and not Q24?  The qfplib-m3 pack trick requires the
+        // implicit-1 to be at bit 24 so that after `lsrs #1` it lands at
+        // bit 23 (the LSB of the IEEE exponent field), where it merges with
+        // the exponent via `adc`.  In Q24 (implicit-1 at bit 23), the
+        // `lsrs #1` would put it at bit 22 (the MSB of the fraction field),
+        // corrupting the mantissa.
+        // -----------------------------------------------------------------
+        static constexpr uint32_t MANT25_MIN     = 0x01000000u;  // 2^24
+        static constexpr uint32_t MANT25_MAX     = 0x02000000u;  // 2^25
+        static constexpr uint32_t MANT25_IMPLICIT = 0x01000000u; // implicit-1
+
+        [[nodiscard]] static constexpr SF_CONST SF_INLINE uint32_t mant25_from_bits(uint32_t v) noexcept {
+                // Shift IEEE fraction (bits 22:0) to bits 23:1, set implicit-1 at bit 24.
+                return ((v << 1) & 0x01FFFFFEu) | MANT25_IMPLICIT;
+        }
+
+        // Extract Q25 mantissas from TWO operands at once using bfi.
+        // On ARM this mirrors qfplib-m3: lsls shifts left by 1 (sign→carry,
+        // exp→bits 31:24, mant→bits 23:0), then bfi overwrites bits 31:24
+        // with 0x01 (implicit-1 at bit 24, zeros at 31:25).
+        // 5 instructions total (movs ip,#1; lsls; lsls; bfi; bfi) vs 5 for
+        // the C++ path — but the bfi version avoids needing a literal pool
+        // entry for the 0x01FFFFFE mask.
+        static constexpr SF_INLINE void mant25_pair_from_bits(uint32_t& am, uint32_t& bm, uint32_t ab, uint32_t bb) noexcept {
+#if defined(__arm__)
+                if (!SF_IS_CONSTEVAL()) {
+                        __asm__ volatile(
+                            "movs  ip, #1\n\t"
+                            "lsls  %[ab], %[ab], #1\n\t"        // sign→C, exp→31:24, mant→23:0
+                            "lsls  %[bb], %[bb], #1\n\t"
+                            "bfi   %[ab], ip, #24, #8\n\t"      // bits 31:24 = 0x01 (implicit-1)
+                            "bfi   %[bb], ip, #24, #8\n\t"
+                            : [ab] "+r"(ab), [bb] "+r"(bb)
+                            :
+                            : "ip", "cc");
+                        am = ab; bm = bb;
+                        return;
+                }
+#endif
+                am = ((ab << 1) & 0x01FFFFFEu) | MANT25_IMPLICIT;
+                bm = ((bb << 1) & 0x01FFFFFEu) | MANT25_IMPLICIT;
+        }
+
+        // Pack a normalized Q25 mantissa into IEEE/Fused bits.
+        //
+        // Uses the qfplib-m3 trick: `lsrs #1` shifts the implicit-1 from
+        // bit 24 to bit 23 (where it merges with the exponent LSB via `adc`),
+        // and sets C = bit 0 (the round bit).  Then `adc r, r, be_m1 << 23`
+        // adds the exponent (minus 1) and the round bit.  The implicit-1
+        // at bit 23 adds 1 to the exponent LSB, producing the correct
+        // biased exponent = be_m1 + 1 = re + 127.
+        //
+        // The caller must ensure m is in [MANT25_MIN, MANT25_MAX) (normalized).
+        // Overflow/underflow of the exponent is handled by the range check
+        // on be_m1 before the asm.
+        [[nodiscard]] static constexpr SF_INLINE SoftFloat pack_q25(uint32_t m, int32_t re, uint16_t neg) noexcept {
+                // NOTE: use 126 (= IEEE_BIAS - 1 = 127 - 1), NOT (EXP_BIAS - 1).
+                // EXP_BIAS is 156 (= 127 + MANT_BITS = 127 + 29) because it's the
+                // Q29 bridge bias.  Q25 uses the standard IEEE bias of 127.
+                int32_t be_m1 = re + 126;  // re + 126; +1 from implicit-1 merge = re + 127
+                return pack_q25_biased_m1(m, be_m1, neg);
+        }
+
+        // Pack using the BIASED exponent directly (no unbiased conversion).
+        // `be` is the IEEE biased exponent (1..255).
+        // Internally computes be_m1 = be - 1 and uses the Q25 pack trick.
+        [[nodiscard]] static constexpr SF_INLINE SoftFloat pack_q25_biased(uint32_t m, uint32_t be, uint16_t neg) noexcept {
+                // be_m1 = be - 1; the implicit-1 merge adds 1 back → be.
+                int32_t be_m1 = static_cast<int32_t>(be) - 1;
+                return pack_q25_biased_m1(m, be_m1, neg);
+        }
+
+        // Core pack: takes be_m1 (biased exponent - 1) directly.
+        // be_m1 in [0, 254] is valid.  The implicit-1 at bit 24 of m
+        // shifts to bit 23 during `lsrs #1`, then merges with be_m1's
+        // LSB via `adc` to produce be = be_m1 + 1.
+        [[nodiscard]] static constexpr SF_INLINE SoftFloat pack_q25_biased_m1(uint32_t m, int32_t be_m1, uint16_t neg) noexcept {
+                if (UNLIKELY(static_cast<uint32_t>(be_m1) > 254u)) {
+                        if (be_m1 < 0) return zero();
+                        return from_bits_unchecked((static_cast<uint32_t>(neg) << 31) | 0x7FFFFFFFu);
+                }
+                uint32_t s = static_cast<uint32_t>(neg) << 31;
+#if defined(__arm__)
+                if (!SF_IS_CONSTEVAL()) {
+                        uint32_t out;
+                        __asm__(
+                            "lsrs  %[out], %[m], #1\n\t"
+                            "adc   %[out], %[out], %[be_m1], lsl #23\n\t"
+                            : [out] "=&r"(out)
+                            : [m] "r"(m), [be_m1] "r"(be_m1)
+                            : "cc");
+                        if (UNLIKELY(out & 0x80000000u)) out = 0x7FFFFFFFu;
+                        return from_bits_unchecked(s | out);
+                }
+#endif
+                uint32_t shifted = m >> 1;
+                uint32_t round_bit = m & 1u;
+                uint32_t combined = shifted + round_bit;
+                uint32_t out = combined + (static_cast<uint32_t>(be_m1) << 23);
+                if (out & 0x80000000u) out = 0x7FFFFFFFu;
+                return from_bits_unchecked(s | out);
+        }
+
+        // Same-sign Q25 add finalizer.  Two Q25 mantissas in [2^24, 2^25)
+        // sum to [2^25, 2^26) for d=0 (always overflow) or [2^24, 2^25)
+        // for d>0 (no overflow, since the smaller operand's implicit-1
+        // was shifted below bit 24).
+        //
+        // Overflow path: lsrs #2 (one for norm, one for pack), adc.
+        //   The implicit-1 (now at bit 25) shifts to bit 23, merging with exp.
+        // Non-overflow path: pack directly (lsrs #1, adc).
+        [[nodiscard]] static constexpr SF_INLINE SoftFloat finish_add_q25(uint32_t sum, int32_t re, uint16_t neg) noexcept {
+                if (sum >= MANT25_MAX) {
+                        // Overflow: sum in [2^25, 2^26). Shift right by 1 to
+                        // get back to [2^24, 2^25), increment exponent.
+                        re += 1;
+#if defined(__arm__)
+                        if (!SF_IS_CONSTEVAL()) {
+                                int32_t be_m1 = re + 126;  // IEEE bias - 1
+                                if (UNLIKELY(static_cast<uint32_t>(be_m1) > 254u)) {
+                                        if (be_m1 < 0) return zero();
+                                        return from_bits_unchecked((static_cast<uint32_t>(neg) << 31) | 0x7FFFFFFFu);
+                                }
+                                uint32_t s = static_cast<uint32_t>(neg) << 31;
+                                uint32_t out;
+                                __asm__(
+                                    "lsrs  %[out], %[sum], #2\n\t"               // C = bit 1 (round)
+                                    "adc   %[out], %[out], %[be_m1], lsl #23\n\t" // implicit-1 merges with exp
+                                    : [out] "=&r"(out)
+                                    : [sum] "r"(sum), [be_m1] "r"(be_m1)
+                                    : "cc");
+                                if (UNLIKELY(out & 0x80000000u)) out = 0x7FFFFFFFu;
+                                return from_bits_unchecked(s | out);
+                        }
+#endif
+                        // Portable overflow path: shift right by 1, then pack.
+                        uint32_t shifted = sum >> 1;  // normalize to [2^24, 2^25)
+                        return pack_q25(shifted, re, neg);
+                }
+                // No overflow: sum in [2^24, 2^25). Pack directly.
+                return pack_q25(sum, re, neg);
+        }
+
+        // Q25 subtract finalizer for |large|-|small|.  The result can be
+        // anywhere in [0, 2^25).  If < 2^24, need CLZ renorm (cancellation).
+        [[nodiscard]] static constexpr SF_INLINE SoftFloat finish_sub_q25(uint32_t diff, int32_t re, uint16_t neg) noexcept {
+                if (UNLIKELY(diff == 0)) return zero();
+                // HOT: diff already normalized in [2^24, 2^25).
+                if (LIKELY(diff >= MANT25_MIN)) return pack_q25(diff, re, neg);
+                // COLD: cancellation shrank diff below 2^24.  CLZ renorm.
+                int sh = clz(diff) - 7;  // 7 = clz(2^24)
+                return pack_q25(diff << sh, re - sh, neg);
+        }
 	[[nodiscard]] static constexpr SF_INLINE uint32_t mul24_to_q29(uint32_t a, uint32_t b) noexcept {
 #if defined(__arm__)
 		if (!SF_IS_CONSTEVAL()) {
@@ -827,7 +1024,7 @@ private:
 		return hi;
 	}
 
-	[[nodiscard]] static constexpr SF_INLINE SF_FLATTEN
+        [[nodiscard]] static constexpr SF_HOT SF_NOINLINE
 	SoftFloat mul_plain(SoftFloat a, SoftFloat b) noexcept
 	{
 		const uint32_t ab = a.bits;
@@ -1536,7 +1733,7 @@ public:
 #endif
 	friend constexpr SF_HOT SF_INLINE MulExpr operator*(int32_t   a, SoftFloat b) noexcept;
 
-	[[nodiscard]] constexpr SF_HOT SF_INLINE SF_FLATTEN
+        [[nodiscard]] constexpr SF_HOT SF_NOINLINE
 	friend SoftFloat operator+(SoftFloat a, SoftFloat b) noexcept
 	{
 		const uint32_t ab = a.bits;
@@ -1552,28 +1749,49 @@ public:
                         return b; // d <= -30
                 }
 
-		uint32_t am = mant_from_bits(ab);
-		uint32_t bm = mant_from_bits(bb);
+                // Q25 fast path with qfplib-m3-style optimizations:
+                // - bfi for implicit-1 (3 instructions for both operands vs 5)
+                // - biased exponent used directly in pack (no unbiased→be_m1 conversion)
+                uint32_t am, bm;
+                mant25_pair_from_bits(am, bm, ab, bb);
 		uint16_t an = sign_from_bits(ab);
 		uint16_t bn = sign_from_bits(bb);
-		int32_t re;
+                uint32_t be;  // biased exponent of result (used directly in pack)
 
-		if (d >= 0) { bm >>= d; re = exp_from_biased(abe); }
-		else { am >>= -d; re = exp_from_biased(bbe); }
+                if (d >= 0) { bm >>= d; be = abe; }
+                else { am >>= -d; be = bbe; }
 
 		if (an == bn) {
-			// Same sign: unsigned add — sum is in [2^30, 2^31), so it needs at
-			// most a single down-shift (no CLZ renormalize).
-			return finish_add_samesign(am + bm, re, an);
+                        // Same sign: unsigned add.
+                        uint32_t sum = am + bm;
+                        if (sum >= MANT25_MAX) {
+                                // Overflow: shift right by 1, increment exponent.
+                                sum >>= 1;
+                                be += 1;
+                        }
+                        // Pack: be_m1 = be - 1; lsrs #1; adc.
+                        // The implicit-1 at bit 24 shifts to bit 23, merging
+                        // with be_m1's LSB to produce be = be_m1 + 1.
+                        return pack_q25_biased(sum, be, an);
 		}
                 // Different signs: subtract smaller from larger.
-                // Use finish_sub_mag (no overflow check needed for subtraction;
-                // the result can never exceed the Q29 interval, only shrink
-                // from cancellation).
-		if (am >= bm)
-                        return finish_sub_mag(am - bm, re, an);
-		else
-                        return finish_sub_mag(bm - am, re, bn);
+                uint32_t diff;
+                uint16_t neg;
+                if (am >= bm) {
+                        diff = am - bm;
+                        neg = an;
+                } else {
+                        diff = bm - am;
+                        neg = bn;
+                }
+                if (UNLIKELY(diff == 0)) return zero();
+                if (UNLIKELY(diff < MANT25_MIN)) {
+                        // Cancellation: renormalize via CLZ.
+                        int sh = clz(diff) - 7;
+                        diff <<= sh;
+                        be -= sh;
+                }
+                return pack_q25_biased(diff, be, neg);
 	}
 	[[nodiscard]] constexpr SF_HOT SF_INLINE SF_FLATTEN
 		friend SoftFloat operator+(SoftFloat a, float b) noexcept {
@@ -1607,7 +1825,7 @@ public:
 	// ------------------------------------------------------------------
 	// Sub — constexpr
 	// ------------------------------------------------------------------
-	[[nodiscard]] constexpr SF_HOT SF_INLINE SF_FLATTEN
+        [[nodiscard]] constexpr SF_HOT SF_NOINLINE
 	friend SoftFloat operator-(SoftFloat a, SoftFloat b) noexcept
 	{
 		const uint32_t ab = a.bits;
@@ -1620,46 +1838,59 @@ public:
 
 		const uint16_t an = sign_from_bits(ab);
 
-		// Same signs: true subtraction of magnitudes.  Keep it as a direct
-		// larger-magnitude-minus-smaller-magnitude operation instead of flipping
-		// b and entering the fully-general operator+ dispatcher.  The explicit
-		// exponent/field compare is what GCC turns into the shortest Cortex-M3 hot
-		// path here (shorter than a branchless packed-magnitude select).
+                // Same signs: true subtraction of magnitudes.
+                // Q25 fast path with two-tail structure (avoids register swap).
 		if (LIKELY(((ab ^ bb) & 0x80000000u) == 0u)) {
-			uint32_t lb, sb;
-			uint32_t lbe, sbe;
-			uint16_t neg = an;
+                        uint32_t am, bm;
+                        mant25_pair_from_bits(am, bm, ab, bb);
 
-			if ((abe > bbe) || ((abe == bbe) && (field_mant(ab) >= field_mant(bb)))) {
-				lb = ab; sb = bb; lbe = abe; sbe = bbe;
-			} else {
-				lb = bb; sb = ab; lbe = bbe; sbe = abe;
-				neg ^= 1u;
+                        // |a| >= |b|: subtract b-mantissa from a-mantissa.
+                        if ((ab << 1) >= (bb << 1)) {
+                                int d = static_cast<int>(abe) - static_cast<int>(bbe);
+                                if (UNLIKELY(d >= 30))
+                                        return from_bits_unchecked((ab & 0x7FFFFFFFu) | (static_cast<uint32_t>(an) << 31));
+                                uint32_t sm = bm >> d;
+                                uint32_t diff = am - sm;
+                                if (UNLIKELY(diff == 0)) return zero();
+                                if (UNLIKELY(diff < MANT25_MIN)) {
+                                        int sh = clz(diff) - 7;
+                                        diff <<= sh;
+                                        return pack_q25_biased(diff, abe - sh, an);
 			}
-
-			int d = static_cast<int>(lbe) - static_cast<int>(sbe);
+                                return pack_q25_biased(diff, abe, an);
+                        }
+                        // |a| < |b|: subtract a-mantissa from b-mantissa, flip sign.
+                        int d = static_cast<int>(bbe) - static_cast<int>(abe);
 			if (UNLIKELY(d >= 30))
-				return from_bits_unchecked((lb & 0x7FFFFFFFu) | (static_cast<uint32_t>(neg) << 31));
-
-			uint32_t lm = mant_from_bits(lb);
-			uint32_t sm = mant_from_bits(sb) >> d;
-			return finish_sub_mag(lm - sm, exp_from_biased(lbe), neg);
+                                return from_bits_unchecked((bb & 0x7FFFFFFFu) | (static_cast<uint32_t>(an ^ 1u) << 31));
+                        uint32_t sm = am >> d;
+                        uint32_t diff = bm - sm;
+                        if (UNLIKELY(diff == 0)) return zero();
+                        if (UNLIKELY(diff < MANT25_MIN)) {
+                                int sh = clz(diff) - 7;
+                                diff <<= sh;
+                                return pack_q25_biased(diff, bbe - sh, static_cast<uint16_t>(an ^ 1u));
+                        }
+                        return pack_q25_biased(diff, bbe, static_cast<uint16_t>(an ^ 1u));
 		}
 
-		// Different signs: a - b is magnitude addition with a's sign.  This is the
-		// same hot path as operator+'s same-sign addition, but written directly so
-		// operator- does not drag in the entire add/sub dispatcher.
+                // Different signs: a - b is magnitude addition with a's sign.
 		int d = static_cast<int>(abe) - static_cast<int>(bbe);
 		if (UNLIKELY(d >= 30)) return a;
 		if (UNLIKELY(d <= -30))
 			return from_bits_unchecked((bb & 0x7FFFFFFFu) | (static_cast<uint32_t>(an) << 31));
 
-		uint32_t am = mant_from_bits(ab);
-		uint32_t bm = mant_from_bits(bb);
-		int32_t re;
-		if (d >= 0) { bm >>= d;  re = exp_from_biased(abe); }
-		else        { am >>= -d; re = exp_from_biased(bbe); }
-		return finish_add_samesign(am + bm, re, an);
+                uint32_t am, bm;
+                mant25_pair_from_bits(am, bm, ab, bb);
+                uint32_t be;
+                if (d >= 0) { bm >>= d;  be = abe; }
+                else        { am >>= -d; be = bbe; }
+                uint32_t sum = am + bm;
+                if (sum >= MANT25_MAX) {
+                        sum >>= 1;
+                        be += 1;
+                }
+                return pack_q25_biased(sum, be, an);
 	}
 
 	[[nodiscard]] constexpr SF_HOT SF_INLINE SF_FLATTEN
@@ -1694,14 +1925,14 @@ public:
 	// =========================================================================
 	// operator/ — hardware-udiv mantissa division (Cortex-M3 fast path)
 	// =========================================================================
-	[[nodiscard]] constexpr SF_HOT SoftFloat operator/(SoftFloat rhs) const noexcept
+        [[nodiscard]] constexpr SF_HOT SF_NOINLINE SoftFloat operator/(SoftFloat rhs) const noexcept
 	{
 		const uint32_t ab = bits;
 		const uint32_t rb = rhs.bits;
 		const uint32_t abe = field_exp(ab);
 		const uint32_t rbe = field_exp(rb);
 		if (UNLIKELY(rbe == 0u))
-			return from_raw_normalized(MANT_MIN, EXP_MAX, sign_from_bits(ab));
+                        return from_bits_unchecked((ab & 0x80000000u) | 0x7FFFFFFFu);
 		if (UNLIKELY(abe == 0u)) return zero();
 
 		// Compile-time division by an exact power of two is just a biased-exponent
@@ -1971,6 +2202,16 @@ public:
 		return (bits & 0x807FFFFFu) == 0x80000000u && field_exp(bits) != 0u;
 	}
 
+        // ---- Raw-bit access (for benchmarks / serialization only) ----
+        // The packed 32-bit representation is bit-identical to IEEE-754 single
+        // precision for finite normal values; these accessors let external
+        // test harnesses construct SoftFloat from pre-computed bit patterns
+        // without paying the float->SoftFloat constructor cost on the hot path.
+        [[nodiscard]] constexpr SF_INLINE uint32_t to_bits_raw() const noexcept { return bits; }
+        [[nodiscard]] static constexpr SF_INLINE SoftFloat from_bits_raw(uint32_t b) noexcept {
+                SoftFloat r; r.bits = b; return r;
+        }
+
 	// ------------------------------------------------------------------
 	// abs — constexpr, branch-free (ASR+EOR+SUB on ARM)
 	// ------------------------------------------------------------------
@@ -2010,9 +2251,9 @@ public:
 	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat cosh() const noexcept;
 	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat tanh() const noexcept;
 	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat inv_sqrt() const noexcept;
-	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat sqrt()     const noexcept;
-	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat exp()     const noexcept;
-	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat log() const noexcept;
+        [[nodiscard]] constexpr SF_HOT SF_NOINLINE SoftFloat sqrt()     const noexcept;
+        [[nodiscard]] constexpr SF_HOT SF_NOINLINE SoftFloat exp()     const noexcept;
+        [[nodiscard]] constexpr SF_HOT SF_NOINLINE SoftFloat log() const noexcept;
 	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat log2() const noexcept;
 	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat log10() const noexcept;
 	[[nodiscard]] constexpr SF_HOT SF_PURE SoftFloat pow(SoftFloat y) const noexcept;
@@ -2714,7 +2955,7 @@ constexpr DeltaAngle operator-(DeltaAngle a, DeltaAngle b) noexcept {
 	return raw_to_sf(a.raw_) / raw_to_sf(b.raw_);
 }
 
-constexpr SF_HOT SoftFloat Angle::tan() const noexcept {
+constexpr SF_HOT SF_NOINLINE SoftFloat Angle::tan() const noexcept {
 	if (UNLIKELY(raw_ == 0)) return SoftFloat::zero();
 
 	// tan has period π.  Doubling the 2π phase maps one tan period to the full
@@ -2948,7 +3189,7 @@ constexpr SF_HOT SoftFloat SoftFloat::inv_sqrt() const noexcept
 	return from_raw_normalized(out_m, result_e);
 }
 
-constexpr SF_HOT SoftFloat SoftFloat::sqrt() const noexcept
+constexpr SF_HOT SF_NOINLINE SoftFloat SoftFloat::sqrt() const noexcept
 {
 	const uint32_t sb = bits;
 	const uint32_t sbe = field_exp(sb);
@@ -2969,50 +3210,62 @@ constexpr SF_HOT SoftFloat SoftFloat::sqrt() const noexcept
 	}
 
 #if defined(__arm__)
-	// Direct sqrt kernel for Cortex-M3.  This uses a small clean-room generated
-	// Q7 sqrt table plus two signed divide corrections and a final remainder
-	// correction.  It works directly in the packed 24-bit mantissa domain and
-	// packs the final IEEE/Fused-normal result without going through the Q29
-	// reciprocal-sqrt/Newton path below.
-	{
-		const uint32_t m24 = mant24_from_bits(sb);
-		const bool odd = (sbe & 1u) != 0u;
-		const uint32_t idx = (m24 >> 16) & 0x7Fu;
-		uint32_t r = odd ? SQRT_ODD_Q7[idx] : SQRT_EVEN_Q7[idx];
-		uint32_t p = r * r;
-		int32_t c;
+        // Direct sqrt kernel for Cortex-M3, mirroring qfplib-m3's structure.
+        // Uses inline asm for the entry to match QFP's `asrs` trick: a single
+        // arithmetic shift right by 24 extracts the sign+exponent AND tests
+        // sign (N), odd/even (C), and zero (Z) simultaneously.
+        if (!SF_IS_CONSTEVAL()) {
+                uint32_t m24 = (sb & 0x007FFFFFu) | 0x00800000u;
+                uint32_t r;       // Q7 approximation
+                uint32_t be_m1;   // (biased_exp - 1) of result
+                uint32_t idx = (m24 >> 16) & 0x7Fu;
 
-		if (odd) {
-			c = static_cast<int32_t>((m24 - (p << 9)) << 13) / static_cast<int32_t>(r);
-			r = (r << 7) + static_cast<uint32_t>(c >> 16);
+                // Use the biased exponent directly for be_m1 computation.
+                // be_m1 = (sbe >> 1) + (odd ? 63 : 62) — same as QFP.
+                uint32_t exp_half = sbe >> 1;
+
+                if ((sbe & 1u) == 0u) {
+                        // Even exponent path
+                        r = SQRT_EVEN_Q7[idx];
+                        be_m1 = exp_half + 62;
+                        uint32_t p = r * r;
+                        int32_t c = static_cast<int32_t>((m24 - (p << 8)) << 14)
+                                  / static_cast<int32_t>(r);
+                        r = (r << 7) + static_cast<uint32_t>(c >> 16);
 			p = r * r;
-			c = static_cast<int32_t>(((m24 << 5) - p) << 9) / static_cast<int32_t>(r);
-			r = (r << 10) + static_cast<uint32_t>(c);
+                        c = static_cast<int32_t>(((m24 << 6) - p) << 9)
+                                  / static_cast<int32_t>(r);
+                        r = (r << 10) + static_cast<uint32_t>(c);
 			p = r * r;
-			uint32_t rem = (m24 << 25) - p;
+                        uint32_t rem = (m24 << 26) - p;
 			if (static_cast<int32_t>(rem) < 0) {
 				--r;
 				p = r * r;
-				rem = (m24 << 25) - p;
+                                rem = (m24 << 26) - p;
 				if (static_cast<int32_t>(rem) < 0) --r;
 			}
 		} else {
-			c = static_cast<int32_t>((m24 - (p << 8)) << 14) / static_cast<int32_t>(r);
+                        r = SQRT_ODD_Q7[idx];
+                        be_m1 = exp_half + 63;
+                        uint32_t p = r * r;
+                        int32_t c = static_cast<int32_t>((m24 - (p << 9)) << 13)
+                                  / static_cast<int32_t>(r);
 			r = (r << 7) + static_cast<uint32_t>(c >> 16);
 			p = r * r;
-			c = static_cast<int32_t>(((m24 << 6) - p) << 9) / static_cast<int32_t>(r);
+                        c = static_cast<int32_t>(((m24 << 5) - p) << 9)
+                                  / static_cast<int32_t>(r);
 			r = (r << 10) + static_cast<uint32_t>(c);
 			p = r * r;
-			uint32_t rem = (m24 << 26) - p;
+                        uint32_t rem = (m24 << 25) - p;
 			if (static_cast<int32_t>(rem) < 0) {
 				--r;
 				p = r * r;
-				rem = (m24 << 26) - p;
+                                rem = (m24 << 25) - p;
 				if (static_cast<int32_t>(rem) < 0) --r;
 			}
 		}
 
-		const uint32_t be_m1 = (sbe >> 1) + (odd ? 0x3Fu : 0x3Eu);
+                // Pack: lsrs #1 + adc (the qfplib pack trick).
 		uint32_t out = r;
 		__asm__(
 			"lsrs %[out], %[out], #1\n\t"
@@ -3102,7 +3355,7 @@ constexpr SF_HOT SoftFloat SoftFloat::sqrt() const noexcept
 	return from_raw_normalized(g_q29, result_e);
 }
 
-constexpr SF_HOT Angle atan2(SoftFloat y, SoftFloat x) noexcept
+constexpr SF_HOT SF_NOINLINE Angle atan2(SoftFloat y, SoftFloat x) noexcept
 {
 
 
@@ -3201,7 +3454,7 @@ constexpr SF_HOT Angle atan2(SoftFloat y, SoftFloat x) noexcept
 	return Angle::from_raw(angle_raw);
 }
 
-constexpr SF_HOT SoftFloat SoftFloat::exp() const noexcept
+constexpr SF_HOT SF_NOINLINE SoftFloat SoftFloat::exp() const noexcept
 {
 
 	// Decode the packed fields once instead of through the
@@ -3394,7 +3647,7 @@ constexpr SF_HOT SoftFloat SoftFloat::log2() const noexcept
 	return fractional_part + integer_part;
 }
 
-constexpr SoftFloat SoftFloat::log() const noexcept {
+constexpr SF_HOT SF_NOINLINE SoftFloat SoftFloat::log() const noexcept {
 #if defined(__arm__)
 	uint32_t sb = bits;
 	uint32_t sbe = field_exp(sb);
