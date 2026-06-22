@@ -537,14 +537,10 @@ private:
 			__asm__(
 			    "lsrs  %[out], %[m], #6\n\t"              // Q29 -> mant24, C = bit 5
 			    "adc.w %[out], %[out], %[be_m1], lsl #23\n\t"
+                            "usat  %[out], #31, %[out]\n\t"           // saturate to [0, 0x7FFFFFFF]
 			    : [out] "=&r"(out)
 			    : [m] "r"(m),[be_m1] "r"(be_m1)
 			    : "cc");
-
-			// If be == 255 and rounding overflowed, ADC can carry into bit 31.
-			// Clamp to your finite-saturation encoding.
-			if (UNLIKELY(out & 0x80000000u))
-				out = 0x7FFFFFFFu;
 
 			return s | out;
 		}
@@ -807,11 +803,10 @@ private:
                         __asm__(
                             "lsrs  %[out], %[m], #6\n\t"
                             "adc.w %[out], %[out], %[be_m1], lsl #23\n\t"
+                            "usat  %[out], #31, %[out]\n\t"           // saturate to [0, 0x7FFFFFFF]
                             : [out] "=&r"(out)
                             : [m] "r"(rm), [be_m1] "r"(be_m1)
                             : "cc");
-                        if (UNLIKELY(out & 0x80000000u))
-                                out = 0x7FFFFFFFu;
                         return from_bits_unchecked(s | out);
                 }
 #endif
@@ -2302,11 +2297,20 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	uint32_t ov = pm_u >> 30;
 	pm_u >>= ov;
 
+        // Precompute addend exponent (used in both d computation and re assignment)
+        int32_t ae = static_cast<int32_t>(abe) - SoftFloat::EXP_BIAS;
+
         // Compute exponent difference directly, deferring pe computation.
-        // d = (abe - EXP_BIAS) - (bbe + cbe - 2*EXP_BIAS + MANT_BITS + ov)
-        //   = abe - (bbe + cbe) + (EXP_BIAS - MANT_BITS) - ov
-        int d = static_cast<int>(abe) - static_cast<int>(bbe + cbe)
-              + (SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) - static_cast<int>(ov);
+        // d = ae - pe, where pe = bbe + cbe - 2*EXP_BIAS + MANT_BITS + ov
+        // d = ae - (bbe + cbe - 2*EXP_BIAS + MANT_BITS + ov)
+        //   = ae - (bbe + cbe) + 2*EXP_BIAS - MANT_BITS - ov
+        //   = ae - (bbe + cbe) + (EXP_BIAS + (EXP_BIAS - MANT_BITS)) - ov
+        // Note: EXP_BIAS - MANT_BITS = 127, so 2*EXP_BIAS - MANT_BITS = 127 + 156 = 283
+        // But we already have ae = abe - EXP_BIAS, so:
+        // d = ae - (bbe + cbe) + EXP_BIAS - MANT_BITS - ov + EXP_BIAS
+        // Wait, let me just compute it directly:
+        // d = ae - pe where pe = (bbe + cbe) - (2*EXP_BIAS - MANT_BITS) + ov
+        int d = ae - (static_cast<int>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int>(ov));
         // Combined range check: (unsigned)(d + 30) >= 60 catches both
         // d >= 30 and d < -30 in a single comparison (saves 1 instruction
         // on the hot path vs two separate checks).
@@ -2321,7 +2325,7 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	const uint16_t an = SoftFloat::sign_from_bits(ab);
 
 	int32_t re;
-	if (d >= 0) { pm_u >>= d; re = SoftFloat::exp_from_biased(abe); }
+        if (d >= 0) { pm_u >>= d; re = ae; }
         else {
                 am_u >>= -d;
                 re = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
@@ -2354,9 +2358,11 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	uint32_t ov = pm_u >> 30;
 	pm_u >>= ov;
 
-        // Compute d directly, deferring pe (same optimization as fused_mul_add)
-        int d = static_cast<int>(abe) - static_cast<int>(bbe + cbe)
-              + (SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) - static_cast<int>(ov);
+        // Precompute addend exponent (same optimization as fused_mul_add)
+        int32_t ae = static_cast<int32_t>(abe) - SoftFloat::EXP_BIAS;
+
+        // Compute d = ae - pe, where pe = (bbe + cbe) - (2*EXP_BIAS - MANT_BITS) + ov
+        int d = ae - (static_cast<int>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int>(ov));
         // Combined range check (same as fused_mul_add)
         if (UNLIKELY(static_cast<uint32_t>(d + 30) >= 60u)) {
                 if (d >= 30) return a;
@@ -2369,7 +2375,7 @@ constexpr SF_INLINE void SoftFloat::normalise_fast(int32_t& m, int32_t& e) noexc
 	const uint16_t an = SoftFloat::sign_from_bits(ab);
 
 	int32_t re;
-	if (d >= 0) { pm_u >>= d; re = SoftFloat::exp_from_biased(abe); }
+        if (d >= 0) { pm_u >>= d; re = ae; }
         else {
                 am_u >>= -d;
                 re = static_cast<int32_t>(bbe + cbe) - (2 * SoftFloat::EXP_BIAS - SoftFloat::MANT_BITS) + static_cast<int32_t>(ov);
